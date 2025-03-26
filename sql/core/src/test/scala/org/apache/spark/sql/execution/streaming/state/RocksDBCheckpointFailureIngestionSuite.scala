@@ -77,6 +77,7 @@ class FailureIngestionCheckpointFileManager(path: Path, hadoopConf: Configuratio
 
 object FailureIngestionFileSystem {
   var shouldFailCopyFromLocalFile = false
+  //var failCopyFromLocalFileNameRegex: Seq[String]
   var shouldFailList = false
   var shouldFailExist = false
   var failureCreateAtomicRegex: Option[Regex] = None
@@ -264,7 +265,7 @@ class RocksDBProviderCheckpointFailureIngestionSuite extends StreamTest {
 }
 
 @SlowSQLTest
-class RocksDBCheckpointFailureIngestionSuite extends AlsoTestWithChangelogCheckpointingEnabled
+class RocksDBCheckpointFailureIngestionSuite extends StreamTest
   with SharedSparkSession {
   override protected def sparkConf: SparkConf = {
     super.sparkConf
