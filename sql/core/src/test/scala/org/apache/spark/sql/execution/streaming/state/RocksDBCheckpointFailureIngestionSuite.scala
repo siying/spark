@@ -43,14 +43,15 @@ class RocksDBCheckpointFailureIngestionSuite extends StreamTest
 
   override def beforeEach(): Unit = {
     super.beforeEach()
-    FailureIngestionFileSystem.shouldFailCopyFromLocalFile = false
+    FailureIngestionFileSystem.failPreCopyFromLocalFileNameRegex = Seq.empty
+    FailureIngestionFileSystem.failureCreateAtomicRegex = Seq.empty
     FailureIngestionFileSystem.shouldFailList = false
     FailureIngestionFileSystem.shouldFailExist = false
   }
 
   implicit def toArray(str: String): Array[Byte] = if (str != null) str.getBytes else null
 
-  test("Basic RocksDB Checkpoint File Write Failure Handling") {
+  test("Basic RocksDB SST File Upload Failure Handling") {
     val fmClass = "org.apache.spark.sql.execution.streaming.state." +
       "FailureIngestionCheckpointFileManager"
     val hadoopConf = new Configuration()
@@ -69,7 +70,7 @@ class RocksDBCheckpointFailureIngestionSuite extends StreamTest
           db.put("version", "1.1")
           db.commit()
 
-            FailureIngestionFileSystem.shouldFailCopyFromLocalFile = true
+          FailureIngestionFileSystem.failPreCopyFromLocalFileNameRegex = Seq(".*sst")
           db.put("version", "2.1")
           intercept[IOException] {
             db.commit()
@@ -77,7 +78,7 @@ class RocksDBCheckpointFailureIngestionSuite extends StreamTest
 
           db.load(1)
 
-            FailureIngestionFileSystem.shouldFailCopyFromLocalFile = false
+          FailureIngestionFileSystem.failPreCopyFromLocalFileNameRegex = Seq.empty
           var ex = intercept[SparkException] {
             db.load(2)
           }
@@ -91,6 +92,55 @@ class RocksDBCheckpointFailureIngestionSuite extends StreamTest
 
           db.load(0)
             FailureIngestionFileSystem.shouldFailExist = true
+          var ex2 = intercept[IOException] {
+            db.load(1)
+          }
+        }
+      }
+    }
+  }
+
+  test("Basic RocksDB Zip File Upload Failure Handling") {
+    val fmClass = "org.apache.spark.sql.execution.streaming.state." +
+      "FailureIngestionCheckpointFileManager"
+    val hadoopConf = new Configuration()
+    hadoopConf.set(STREAMING_CHECKPOINT_FILE_MANAGER_CLASS.parent.key, fmClass)
+    withTempDir { remoteDir =>
+      withSQLConf(
+        RocksDBConf.ROCKSDB_SQL_CONF_NAME_PREFIX + ".changelogCheckpointing.enabled" -> "false") {
+        val conf = RocksDBConf(StateStoreConf(SQLConf.get))
+        withDB(
+          remoteDir.getAbsolutePath,
+          version = 0,
+          conf = conf,
+          hadoopConf = hadoopConf,
+          useColumnFamilies = true
+        ) { db =>
+          db.put("version", "1.1")
+          db.commit()
+
+          FailureIngestionFileSystem.failureCreateAtomicRegex = Seq(".*zip")
+          db.put("version", "2.1")
+          intercept[IOException] {
+            db.commit()
+          }
+
+          db.load(1)
+
+          FailureIngestionFileSystem.failureCreateAtomicRegex = Seq.empty
+          var ex = intercept[SparkException] {
+            db.load(2)
+          }
+          checkError(
+            ex,
+            condition = "CANNOT_LOAD_STATE_STORE.CANNOT_READ_STREAMING_STATE_FILE",
+            parameters = Map(
+              "fileToRead" -> s"$remoteDir/2.changelog"
+            )
+          )
+
+          db.load(0)
+          FailureIngestionFileSystem.shouldFailExist = true
           var ex2 = intercept[IOException] {
             db.load(1)
           }
