@@ -19,8 +19,6 @@ package org.apache.spark.sql.execution.streaming.state
 import java.io._
 import java.net.URI
 
-import scala.util.matching.Regex
-
 import org.apache.hadoop.conf.Configuration
 import org.apache.hadoop.fs._
 import org.apache.hadoop.fs.permission.FsPermission
@@ -34,8 +32,8 @@ class FailureIngestionCheckpointFileManager(path: Path, hadoopConf: Configuratio
 
   override def createAtomic(path: Path,
                             overwriteIfPossible: Boolean): CancellableFSDataOutputStream = {
-    FailureIngestionFileSystem.failureCreateAtomicRegex.foreach { regex =>
-      if (regex.findFirstIn(path.toString).isDefined) {
+    FailureIngestionFileSystem.failureCreateAtomicRegex.foreach { pattern =>
+      if (path.toString.matches(pattern)) {
         throw new IOException("Fake File System Create Atomic Failure")
       }
     }
@@ -66,11 +64,10 @@ class FailureIngestionCheckpointFileManager(path: Path, hadoopConf: Configuratio
 }
 
 object FailureIngestionFileSystem {
-  var shouldFailCopyFromLocalFile = false
-  // var failCopyFromLocalFileNameRegex: Seq[String]
+  var failPreCopyFromLocalFileNameRegex: Seq[String] = Seq.empty
   var shouldFailList = false
   var shouldFailExist = false
-  var failureCreateAtomicRegex: Option[Regex] = None
+  var failureCreateAtomicRegex: Seq[String] = Seq.empty
 }
 
 class FailureIngestionFileSystem(innerFs: FileSystem) extends FileSystem {
@@ -114,10 +111,13 @@ class FailureIngestionFileSystem(innerFs: FileSystem) extends FileSystem {
   override def getFileStatus(f: Path): FileStatus = innerFs.getFileStatus(f)
 
   override def copyFromLocalFile(src: Path, dst: Path): Unit = {
-    innerFs.copyFromLocalFile(src, dst)
-    if (FailureIngestionFileSystem.shouldFailCopyFromLocalFile) {
-      throw new IOException("Fake File System Copy Failure")
+    FailureIngestionFileSystem.failPreCopyFromLocalFileNameRegex.foreach { pattern =>
+      if (src.toString.matches(pattern)) {
+        throw new IOException(s"Injected failure due to source path matching pattern: $pattern")
+      }
     }
+
+    innerFs.copyFromLocalFile(src, dst)
   }
 }
 
