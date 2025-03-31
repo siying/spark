@@ -456,6 +456,7 @@ class RocksDB(
         useColumnFamilies,
         sessionStateStoreCkptId,
         Some(currVersionLineage)))
+      logWarning(s"CHANGGGGGGG $changelogWriter")
     }
     this
   }
@@ -1015,6 +1016,7 @@ class RocksDB(
       logInfo(log"Flushing updates for ${MDC(LogKeys.VERSION_NUM, newVersion)}")
 
       var snapshot: Option[RocksDBSnapshot] = None
+      logWarning(s"sssssss $shouldForceSnapshot")
       if (shouldCreateSnapshot() || shouldForceSnapshot.get()) {
         val (newSnapshot, snapshotLatency) = createSnapshot(newVersion, sessionStateStoreCkptId)
         snapshot = newSnapshot
@@ -1092,8 +1094,10 @@ class RocksDB(
 
   private def shouldCreateSnapshot(): Boolean = {
     if (enableChangelogCheckpointing) {
+      logWarning(s"IIIIIIIII $changelogWriter")
       assert(changelogWriter.isDefined)
       val newVersion = loadedVersion + 1
+      logWarning(s"ttttttt $newVersion $lastSnapshotVersion ${conf.minDeltasForSnapshot}")
       newVersion - lastSnapshotVersion >= conf.minDeltasForSnapshot
     } else true
   }

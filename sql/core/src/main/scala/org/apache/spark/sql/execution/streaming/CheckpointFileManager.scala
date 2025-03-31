@@ -167,7 +167,7 @@ object CheckpointFileManager extends Logging {
             s"But $finalPath does not exist.")
         }
 
-        logInfo(log"Renamed temp file ${MDC(TEMP_PATH, tempPath)} to " +
+        logWarning(log"Renamed temp file ${MDC(TEMP_PATH, tempPath)} to " +
           log"${MDC(FINAL_PATH, finalPath)}")
       } finally {
         terminated = true

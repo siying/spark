@@ -24,40 +24,70 @@ import org.apache.hadoop.fs._
 import org.apache.hadoop.fs.permission.FsPermission
 import org.apache.hadoop.util.Progressable
 
+import org.apache.spark.internal.Logging
 import org.apache.spark.sql.execution.streaming.CheckpointFileManager.{CancellableFSDataOutputStream, RenameBasedFSDataOutputStream}
 import org.apache.spark.sql.execution.streaming.FileSystemBasedCheckpointFileManager
 
+class DelayCloseFSDataOutputStreamWrapper(stream: CancellableFSDataOutputStream)
+  extends CancellableFSDataOutputStream(stream.getWrappedStream) with Logging {
+  val originalStream: CancellableFSDataOutputStream = stream
+
+  var closed: Boolean = false
+
+  override def close(): Unit = {
+    if (!closed) {
+      closed = true
+      logWarning(s"EEEE")
+      FailureIngestionFileSystem.delayedStreams =
+        FailureIngestionFileSystem.delayedStreams :+ originalStream
+      throw new IOException("Fake File Stream Close Failure")
+    }
+  }
+
+  /** Cancel the `underlyingStream` and ensure that the output file is not generated. */
+  override def cancel(): Unit = {}
+}
+
 class FailureIngestionCheckpointFileManager(path: Path, hadoopConf: Configuration)
-  extends FileSystemBasedCheckpointFileManager(path, hadoopConf) {
+  extends FileSystemBasedCheckpointFileManager(path, hadoopConf) with Logging {
 
   override def createAtomic(path: Path,
                             overwriteIfPossible: Boolean): CancellableFSDataOutputStream = {
+    logWarning(s"CCCCCCC $path")
     FailureIngestionFileSystem.failureCreateAtomicRegex.foreach { pattern =>
       if (path.toString.matches(pattern)) {
         throw new IOException("Fake File System Create Atomic Failure")
       }
     }
-    new RenameBasedFSDataOutputStream(this, path, overwriteIfPossible)
+
+    var shouldDelay = false
+    FailureIngestionFileSystem.createAtomicDelayCloseRegex.foreach { pattern =>
+      if (path.toString.matches(pattern)) {
+        shouldDelay = true
+      }
+    }
+    val ret = new RenameBasedFSDataOutputStream(this, path, overwriteIfPossible)
+    if (shouldDelay) {
+      logWarning(s"TTTTTTTTTT")
+      new DelayCloseFSDataOutputStreamWrapper(ret)
+    } else {
+      ret
+    }
+
   }
 
   override def renameTempFile(srcPath: Path, dstPath: Path,
                               overwriteIfPossible: Boolean): Unit = {
-    if (!fs.exists(dstPath)) {
-      // only write if a file does not exist at this location
-      super.renameTempFile(srcPath, dstPath, overwriteIfPossible)
-    }
+    super.renameTempFile(srcPath, dstPath, overwriteIfPossible)
   }
 
   override def list(path: Path, filter: PathFilter): Array[FileStatus] = {
-    if (FailureIngestionFileSystem.shouldFailList) {
-      throw new IOException("Fake File System List Status Failure")
-    }
     super.list(path, filter)
   }
 
   override def exists(path: Path): Boolean = {
     if (FailureIngestionFileSystem.shouldFailExist) {
-      throw new IOException("Fake File System Exist Failure")
+      throw new IOException("Fake File Exists Failure")
     }
     super.exists(path)
   }
@@ -65,9 +95,11 @@ class FailureIngestionCheckpointFileManager(path: Path, hadoopConf: Configuratio
 
 object FailureIngestionFileSystem {
   var failPreCopyFromLocalFileNameRegex: Seq[String] = Seq.empty
-  var shouldFailList = false
-  var shouldFailExist = false
+  var createAtomicDelayCloseRegex: Seq[String] = Seq.empty
   var failureCreateAtomicRegex: Seq[String] = Seq.empty
+  var shouldFailExist: Boolean = false
+
+  var delayedStreams: Seq[CancellableFSDataOutputStream] = Seq.empty
 }
 
 class FailureIngestionFileSystem(innerFs: FileSystem) extends FileSystem {
@@ -98,9 +130,6 @@ class FailureIngestionFileSystem(innerFs: FileSystem) extends FileSystem {
   override def delete(f: Path, recursive: Boolean): Boolean = innerFs.delete(f, recursive)
 
   override def listStatus(f: Path): Array[FileStatus] = {
-    if (FailureIngestionFileSystem.shouldFailList) {
-      throw new IOException("Fake File System List Status Failure")
-    }
     innerFs.listStatus(f)
   }
 
