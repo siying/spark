@@ -24,9 +24,12 @@ import scala.language.implicitConversions
 import org.apache.hadoop.conf.Configuration
 
 import org.apache.spark.{SparkConf, SparkException}
+import org.apache.spark.sql.execution.streaming.MemoryStream
+import org.apache.spark.sql.functions.count
 import org.apache.spark.sql.internal.SQLConf
 import org.apache.spark.sql.internal.SQLConf.STREAMING_CHECKPOINT_FILE_MANAGER_CLASS
 import org.apache.spark.sql.streaming._
+import org.apache.spark.sql.streaming.OutputMode.Update
 import org.apache.spark.sql.test.SharedSparkSession
 import org.apache.spark.tags.SlowSQLTest
 import org.apache.spark.util.Utils
@@ -445,6 +448,205 @@ class RocksDBCheckpointFailureIngestionSuite extends StreamTest
         ) { db =>
           assert(new String(db.get("version"), "UTF-8") == "2.2")
           assert(new String(db.get("foo"), "UTF-8") == "bar")
+        }
+      }
+    }
+  }
+
+  import testImplicits._
+
+  // Test both cases where the underlying file system supports rename to overwrite or not.
+  Seq(false, true).foreach { ifAllowRenameOverwrite =>
+    test(s"Job failure with changelog shows up ifAllowRenameOverwrite = $ifAllowRenameOverwrite") {
+      val fmClass = "org.apache.spark.sql.execution.streaming.state." +
+        "FailureIngestionCheckpointFileManager"
+      val hadoopConf = new Configuration()
+      hadoopConf.set(STREAMING_CHECKPOINT_FILE_MANAGER_CLASS.parent.key, fmClass)
+      val rocksdbChangelogCheckpointingConfKey =
+        RocksDBConf.ROCKSDB_SQL_CONF_NAME_PREFIX + ".changelogCheckpointing.enabled"
+      FailureIngestionFileSystem.allowOverwriteInRename = ifAllowRenameOverwrite
+      withTempDir { checkpointDir =>
+        withTempDir { remoteDir =>
+          withSQLConf(
+            rocksdbChangelogCheckpointingConfKey -> "true",
+            SQLConf.STATE_STORE_MIN_DELTAS_FOR_SNAPSHOT.key -> "2") {
+            val inputData = MemoryStream[Int]
+            val aggregated =
+              inputData.toDF()
+                .groupBy($"value")
+                .agg(count("*"))
+                .as[(Int, Long)]
+
+            FailureIngestionFileSystem.createAtomicDelayCloseRegex = Seq(".*/2_.*changelog")
+
+            // Run the stream with changelog checkpointing disabled.
+            testStream(aggregated, Update)(
+              StartStream(checkpointLocation = checkpointDir.getAbsolutePath,
+                additionalConfs = Map(
+                  rocksdbChangelogCheckpointingConfKey -> "true",
+                  SQLConf.STATE_STORE_CHECKPOINT_FORMAT_VERSION.key -> "2",
+                  STREAMING_CHECKPOINT_FILE_MANAGER_CLASS.parent.key -> fmClass)),
+              AddData(inputData, 3),
+              CheckLastBatch((3, 1)),
+              AddData(inputData, 3, 2),
+              ExpectFailure[SparkException] { ex =>
+                ex.getCause.getMessage.contains("CANNOT_WRITE_STATE_STORE.CANNOT_COMMIT")
+              },
+              AddData(inputData, 3, 1)
+            )
+            FailureIngestionFileSystem.delayedStreams.foreach(_.close())
+            FailureIngestionFileSystem.delayedStreams = Seq.empty
+            FailureIngestionFileSystem.createAtomicDelayCloseRegex = Seq.empty
+
+            testStream(aggregated, Update)(
+              StartStream(checkpointLocation = checkpointDir.getAbsolutePath,
+                additionalConfs = Map(
+                  rocksdbChangelogCheckpointingConfKey -> "true",
+                  SQLConf.STATE_STORE_CHECKPOINT_FORMAT_VERSION.key -> "2",
+                  STREAMING_CHECKPOINT_FILE_MANAGER_CLASS.parent.key -> fmClass)),
+              AddData(inputData, 4),
+              CheckLastBatch((3, 3), (1, 1), (4, 1)),
+              StopStream
+            )
+          }
+        }
+      }
+    }
+  }
+
+  test("Previous Changelog Overwrite") {
+    val fmClass = "org.apache.spark.sql.execution.streaming.state." +
+      "FailureIngestionCheckpointFileManager"
+    val hadoopConf = new Configuration()
+    hadoopConf.set(STREAMING_CHECKPOINT_FILE_MANAGER_CLASS.parent.key, fmClass)
+    val rocksdbChangelogCheckpointingConfKey =
+      RocksDBConf.ROCKSDB_SQL_CONF_NAME_PREFIX + ".changelogCheckpointing.enabled"
+    withTempDir { checkpointDir =>
+      withTempDir { remoteDir =>
+        withSQLConf(
+          rocksdbChangelogCheckpointingConfKey -> "true",
+          SQLConf.STATE_STORE_MIN_DELTAS_FOR_SNAPSHOT.key -> "2") {
+          val inputData = MemoryStream[Int]
+          val aggregated =
+            inputData.toDF()
+              .groupBy($"value")
+              .agg(count("*"))
+              .as[(Int, Long)]
+
+          FailureIngestionFileSystem.createAtomicDelayCloseRegex = Seq(".*/2_.*changelog")
+
+          // Run the stream with changelog checkpointing disabled.
+          testStream(aggregated, Update)(
+            StartStream(checkpointLocation = checkpointDir.getAbsolutePath,
+              additionalConfs = Map(
+                rocksdbChangelogCheckpointingConfKey -> "true",
+                SQLConf.STATE_STORE_CHECKPOINT_FORMAT_VERSION.key -> "2",
+                STREAMING_CHECKPOINT_FILE_MANAGER_CLASS.parent.key -> fmClass)),
+            AddData(inputData, 3),
+            CheckAnswer((3, 1)),
+            AddData(inputData, 3, 2),
+            ExpectFailure[SparkException] { ex =>
+              ex.getCause.getMessage.contains("CANNOT_WRITE_STATE_STORE.CANNOT_COMMIT")
+            },
+            AddData(inputData, 3, 1)
+          )
+          FailureIngestionFileSystem.createAtomicDelayCloseRegex = Seq.empty
+
+          testStream(aggregated, Update)(
+            StartStream(checkpointLocation = checkpointDir.getAbsolutePath,
+              additionalConfs = Map(
+                rocksdbChangelogCheckpointingConfKey -> "true",
+                SQLConf.STATE_STORE_CHECKPOINT_FORMAT_VERSION.key -> "2",
+                STREAMING_CHECKPOINT_FILE_MANAGER_CLASS.parent.key -> fmClass)),
+            AddData(inputData, 1),
+            CheckAnswer((3, 2), (3, 3), (2, 1), (1, 2)),
+            StopStream
+          )
+          FailureIngestionFileSystem.delayedStreams.foreach(_.close())
+          FailureIngestionFileSystem.delayedStreams = Seq.empty
+
+          testStream(aggregated, Update)(
+            StartStream(checkpointLocation = checkpointDir.getAbsolutePath,
+              additionalConfs = Map(
+                rocksdbChangelogCheckpointingConfKey -> "true",
+                SQLConf.STATE_STORE_CHECKPOINT_FORMAT_VERSION.key -> "2",
+                STREAMING_CHECKPOINT_FILE_MANAGER_CLASS.parent.key -> fmClass)),
+            AddData(inputData, 3, 1, 4),
+            CheckAnswer((3, 4), (1, 3), (4, 1)),
+            StopStream
+          )
+        }
+      }
+    }
+  }
+
+  test("Previous Maintenance Snapshot Checkpoint Overwrite") {
+    val fmClass = "org.apache.spark.sql.execution.streaming.state." +
+      "FailureIngestionCheckpointFileManager"
+    val hadoopConf = new Configuration()
+    hadoopConf.set(STREAMING_CHECKPOINT_FILE_MANAGER_CLASS.parent.key, fmClass)
+    val rocksdbChangelogCheckpointingConfKey =
+      RocksDBConf.ROCKSDB_SQL_CONF_NAME_PREFIX + ".changelogCheckpointing.enabled"
+    withTempDir { checkpointDir =>
+      withTempDir { remoteDir =>
+        withSQLConf(
+          rocksdbChangelogCheckpointingConfKey -> "true",
+          SQLConf.STATE_STORE_MIN_DELTAS_FOR_SNAPSHOT.key -> "2") {
+          val inputData = MemoryStream[Int]
+          val aggregated =
+            inputData.toDF()
+              .groupBy($"value")
+              .agg(count("*"))
+              .as[(Int, Long)]
+
+          FailureIngestionFileSystem.createAtomicDelayCloseRegex = Seq(".*/*zip")
+
+          // Run the stream with changelog checkpointing disabled.
+          testStream(aggregated, Update)(
+            StartStream(checkpointLocation = checkpointDir.getAbsolutePath,
+              additionalConfs = Map(
+                rocksdbChangelogCheckpointingConfKey -> "true",
+                SQLConf.STATE_STORE_CHECKPOINT_FORMAT_VERSION.key -> "2",
+                STREAMING_CHECKPOINT_FILE_MANAGER_CLASS.parent.key -> fmClass)),
+            AddData(inputData, 3),
+            CheckAnswer((3, 1)),
+            AddData(inputData, 3, 2),
+            AddData(inputData, 3, 1),
+            CheckAnswer((3, 1), (3, 3), (2, 1), (1, 1)),
+            AddData(inputData, 1),
+            CheckAnswer((3, 1), (3, 3), (2, 1), (1, 1), (1, 2)),
+            Execute { _ =>
+              while (FailureIngestionFileSystem.delayedStreams.isEmpty) {
+                Thread.sleep(1)
+              }
+            },
+            StopStream
+          )
+          FailureIngestionFileSystem.createAtomicDelayCloseRegex = Seq.empty
+
+          testStream(aggregated, Update)(
+            StartStream(checkpointLocation = checkpointDir.getAbsolutePath,
+              additionalConfs = Map(
+                rocksdbChangelogCheckpointingConfKey -> "true",
+                SQLConf.STATE_STORE_CHECKPOINT_FORMAT_VERSION.key -> "2",
+                STREAMING_CHECKPOINT_FILE_MANAGER_CLASS.parent.key -> fmClass)),
+            AddData(inputData, 1),
+            CheckAnswer((3, 2), (3, 3), (2, 1), (1, 2)),
+            StopStream
+          )
+          FailureIngestionFileSystem.delayedStreams.foreach(_.close())
+          FailureIngestionFileSystem.delayedStreams = Seq.empty
+
+          testStream(aggregated, Update)(
+            StartStream(checkpointLocation = checkpointDir.getAbsolutePath,
+              additionalConfs = Map(
+                rocksdbChangelogCheckpointingConfKey -> "true",
+                SQLConf.STATE_STORE_CHECKPOINT_FORMAT_VERSION.key -> "2",
+                STREAMING_CHECKPOINT_FILE_MANAGER_CLASS.parent.key -> fmClass)),
+            AddData(inputData, 3, 1, 4),
+            CheckAnswer((3, 4), (1, 3), (4, 1)),
+            StopStream
+          )
         }
       }
     }

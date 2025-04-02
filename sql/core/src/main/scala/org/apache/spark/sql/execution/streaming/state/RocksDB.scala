@@ -75,6 +75,8 @@ class RocksDB(
     enableStateStoreCheckpointIds: Boolean = false,
     partitionId: Int = 0) extends Logging {
 
+  logWarning(s"eeeeeeeee $enableStateStoreCheckpointIds")
+
   import RocksDB._
 
   @volatile private var lastSnapshotVersion = 0L
@@ -579,7 +581,7 @@ class RocksDB(
     assert(version >= 0)
     acquire(LoadStore)
     recordedMetrics = None
-    logInfo(log"Loading ${MDC(LogKeys.VERSION_NUM, version)} with stateStoreCkptId: ${
+    logWarning(log"Loading ${MDC(LogKeys.VERSION_NUM, version)} with stateStoreCkptId: ${
       MDC(LogKeys.UUID, stateStoreCkptId.getOrElse(""))}")
     if (stateStoreCkptId.isDefined || enableStateStoreCheckpointIds && version == 0) {
       loadWithCheckpointId(version, stateStoreCkptId, readOnly)

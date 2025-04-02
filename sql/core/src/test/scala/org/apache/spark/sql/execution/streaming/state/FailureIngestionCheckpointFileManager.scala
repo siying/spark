@@ -40,6 +40,7 @@ class DelayCloseFSDataOutputStreamWrapper(stream: CancellableFSDataOutputStream)
       logWarning(s"EEEE")
       FailureIngestionFileSystem.delayedStreams =
         FailureIngestionFileSystem.delayedStreams :+ originalStream
+      log
       throw new IOException("Fake File Stream Close Failure")
     }
   }
@@ -78,7 +79,11 @@ class FailureIngestionCheckpointFileManager(path: Path, hadoopConf: Configuratio
 
   override def renameTempFile(srcPath: Path, dstPath: Path,
                               overwriteIfPossible: Boolean): Unit = {
-    super.renameTempFile(srcPath, dstPath, overwriteIfPossible)
+    if (FailureIngestionFileSystem.allowOverwriteInRename || !fs.exists(dstPath)) {
+      super.renameTempFile(srcPath, dstPath, overwriteIfPossible)
+    } else {
+      logWarning(s"Skip renaming temp file $srcPath to $dstPath because it already exists.")
+    }
   }
 
   override def list(path: Path, filter: PathFilter): Array[FileStatus] = {
@@ -98,6 +103,7 @@ object FailureIngestionFileSystem {
   var createAtomicDelayCloseRegex: Seq[String] = Seq.empty
   var failureCreateAtomicRegex: Seq[String] = Seq.empty
   var shouldFailExist: Boolean = false
+  var allowOverwriteInRename: Boolean = true
 
   var delayedStreams: Seq[CancellableFSDataOutputStream] = Seq.empty
 }
