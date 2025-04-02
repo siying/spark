@@ -38,8 +38,8 @@ class DelayCloseFSDataOutputStreamWrapper(stream: CancellableFSDataOutputStream)
     if (!closed) {
       closed = true
       logWarning(s"EEEE")
-      FailureIngestionFileSystem.delayedStreams =
-        FailureIngestionFileSystem.delayedStreams :+ originalStream
+      FailureInjectionFileSystem.delayedStreams =
+        FailureInjectionFileSystem.delayedStreams :+ originalStream
       log
       throw new IOException("Fake File Stream Close Failure")
     }
@@ -49,20 +49,20 @@ class DelayCloseFSDataOutputStreamWrapper(stream: CancellableFSDataOutputStream)
   override def cancel(): Unit = {}
 }
 
-class FailureIngestionCheckpointFileManager(path: Path, hadoopConf: Configuration)
+class FailureInjectionCheckpointFileManager(path: Path, hadoopConf: Configuration)
   extends FileSystemBasedCheckpointFileManager(path, hadoopConf) with Logging {
 
   override def createAtomic(path: Path,
                             overwriteIfPossible: Boolean): CancellableFSDataOutputStream = {
     logWarning(s"CCCCCCC $path")
-    FailureIngestionFileSystem.failureCreateAtomicRegex.foreach { pattern =>
+    FailureInjectionFileSystem.failureCreateAtomicRegex.foreach { pattern =>
       if (path.toString.matches(pattern)) {
         throw new IOException("Fake File System Create Atomic Failure")
       }
     }
 
     var shouldDelay = false
-    FailureIngestionFileSystem.createAtomicDelayCloseRegex.foreach { pattern =>
+    FailureInjectionFileSystem.createAtomicDelayCloseRegex.foreach { pattern =>
       if (path.toString.matches(pattern)) {
         shouldDelay = true
       }
@@ -79,7 +79,7 @@ class FailureIngestionCheckpointFileManager(path: Path, hadoopConf: Configuratio
 
   override def renameTempFile(srcPath: Path, dstPath: Path,
                               overwriteIfPossible: Boolean): Unit = {
-    if (FailureIngestionFileSystem.allowOverwriteInRename || !fs.exists(dstPath)) {
+    if (FailureInjectionFileSystem.allowOverwriteInRename || !fs.exists(dstPath)) {
       super.renameTempFile(srcPath, dstPath, overwriteIfPossible)
     } else {
       logWarning(s"Skip renaming temp file $srcPath to $dstPath because it already exists.")
@@ -91,14 +91,14 @@ class FailureIngestionCheckpointFileManager(path: Path, hadoopConf: Configuratio
   }
 
   override def exists(path: Path): Boolean = {
-    if (FailureIngestionFileSystem.shouldFailExist) {
+    if (FailureInjectionFileSystem.shouldFailExist) {
       throw new IOException("Fake File Exists Failure")
     }
     super.exists(path)
   }
 }
 
-object FailureIngestionFileSystem {
+object FailureInjectionFileSystem {
   var failPreCopyFromLocalFileNameRegex: Seq[String] = Seq.empty
   var createAtomicDelayCloseRegex: Seq[String] = Seq.empty
   var failureCreateAtomicRegex: Seq[String] = Seq.empty
@@ -108,7 +108,7 @@ object FailureIngestionFileSystem {
   var delayedStreams: Seq[CancellableFSDataOutputStream] = Seq.empty
 }
 
-class FailureIngestionFileSystem(innerFs: FileSystem) extends FileSystem {
+class FailureInjectionFileSystem(innerFs: FileSystem) extends FileSystem {
 
   override def getConf: Configuration = innerFs.getConf
 
@@ -146,7 +146,7 @@ class FailureIngestionFileSystem(innerFs: FileSystem) extends FileSystem {
   override def getFileStatus(f: Path): FileStatus = innerFs.getFileStatus(f)
 
   override def copyFromLocalFile(src: Path, dst: Path): Unit = {
-    FailureIngestionFileSystem.failPreCopyFromLocalFileNameRegex.foreach { pattern =>
+    FailureInjectionFileSystem.failPreCopyFromLocalFileNameRegex.foreach { pattern =>
       if (src.toString.matches(pattern)) {
         throw new IOException(s"Injected failure due to source path matching pattern: $pattern")
       }
@@ -156,7 +156,7 @@ class FailureIngestionFileSystem(innerFs: FileSystem) extends FileSystem {
   }
 }
 
-class FailureIngestionRocksDBStateStoreProvider extends RocksDBStateStoreProvider {
+class FailureInjectionRocksDBStateStoreProvider extends RocksDBStateStoreProvider {
   override def CreateRocksDB(
                               dfsRootDir: String,
                               conf: RocksDBConf,
@@ -164,28 +164,30 @@ class FailureIngestionRocksDBStateStoreProvider extends RocksDBStateStoreProvide
                               hadoopConf: Configuration,
                               loggingId: String,
                               useColumnFamilies: Boolean,
-                              enableStateStoreCheckpointIds: Boolean): RocksDB = {
-    FailureIngestionRocksDBStateStoreProvider.createRocksDBWithFaultIngestion(
+                              enableStateStoreCheckpointIds: Boolean,
+                              partitionId: Int): RocksDB = {
+    FailureInjectionRocksDBStateStoreProvider.createRocksDBWithFaultInjection(
       dfsRootDir,
       conf,
       localRootDir,
       hadoopConf,
       loggingId,
       useColumnFamilies,
-      enableStateStoreCheckpointIds
-    )
+      enableStateStoreCheckpointIds,
+      partitionId)
   }
 }
 
-object FailureIngestionRocksDBStateStoreProvider {
-  def createRocksDBWithFaultIngestion(
+object FailureInjectionRocksDBStateStoreProvider {
+  def createRocksDBWithFaultInjection(
                                        dfsRootDir: String,
                                        conf: RocksDBConf,
                                        localRootDir: File,
                                        hadoopConf: Configuration,
                                        loggingId: String,
                                        useColumnFamilies: Boolean,
-                                       enableStateStoreCheckpointIds: Boolean): RocksDB = {
+                                       enableStateStoreCheckpointIds: Boolean,
+                                       partitionId: Int): RocksDB = {
     new RocksDB(
       dfsRootDir,
       conf = conf,
@@ -193,7 +195,8 @@ object FailureIngestionRocksDBStateStoreProvider {
       hadoopConf = hadoopConf,
       loggingId = loggingId,
       useColumnFamilies = useColumnFamilies,
-      enableStateStoreCheckpointIds = enableStateStoreCheckpointIds
+      enableStateStoreCheckpointIds = enableStateStoreCheckpointIds,
+      partitionId = partitionId
     ) {
       override def CreateFileManager(
                                       dfsRootDir: String,
@@ -211,7 +214,7 @@ object FailureIngestionRocksDBStateStoreProvider {
           override def GetFileSystem(
                                       myDfsRootDir: String,
                                       myHadoopConf: Configuration): FileSystem = {
-            new FailureIngestionFileSystem(new Path(myDfsRootDir).getFileSystem(myHadoopConf))
+            new FailureInjectionFileSystem(new Path(myDfsRootDir).getFileSystem(myHadoopConf))
           }
         }
       }

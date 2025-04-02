@@ -36,7 +36,7 @@ import org.apache.spark.util.Utils
 
 
 @SlowSQLTest
-class RocksDBCheckpointFailureIngestionSuite extends StreamTest
+class RocksDBCheckpointFailureInjectionSuite extends StreamTest
   with SharedSparkSession {
   override protected def sparkConf: SparkConf = {
     super.sparkConf
@@ -46,16 +46,16 @@ class RocksDBCheckpointFailureIngestionSuite extends StreamTest
 
   override def beforeEach(): Unit = {
     super.beforeEach()
-    FailureIngestionFileSystem.failPreCopyFromLocalFileNameRegex = Seq.empty
-    FailureIngestionFileSystem.failureCreateAtomicRegex = Seq.empty
-    FailureIngestionFileSystem.shouldFailExist = false
+    FailureInjectionFileSystem.failPreCopyFromLocalFileNameRegex = Seq.empty
+    FailureInjectionFileSystem.failureCreateAtomicRegex = Seq.empty
+    FailureInjectionFileSystem.shouldFailExist = false
   }
 
   implicit def toArray(str: String): Array[Byte] = if (str != null) str.getBytes else null
 
   test("Basic RocksDB SST File Upload Failure Handling") {
     val fmClass = "org.apache.spark.sql.execution.streaming.state." +
-      "FailureIngestionCheckpointFileManager"
+      "FailureInjectionCheckpointFileManager"
     val hadoopConf = new Configuration()
     hadoopConf.set(STREAMING_CHECKPOINT_FILE_MANAGER_CLASS.parent.key, fmClass)
     withTempDir { remoteDir =>
@@ -69,17 +69,17 @@ class RocksDBCheckpointFailureIngestionSuite extends StreamTest
           hadoopConf = hadoopConf
         ) { db =>
           db.put("version", "1.1")
-          db.commit()
+          commitAndGetCheckpointId(db)
 
-          FailureIngestionFileSystem.failPreCopyFromLocalFileNameRegex = Seq(".*sst")
+          FailureInjectionFileSystem.failPreCopyFromLocalFileNameRegex = Seq(".*sst")
           db.put("version", "2.1")
           intercept[IOException] {
-            db.commit()
+            commitAndGetCheckpointId(db)
           }
 
           db.load(1)
 
-          FailureIngestionFileSystem.failPreCopyFromLocalFileNameRegex = Seq.empty
+          FailureInjectionFileSystem.failPreCopyFromLocalFileNameRegex = Seq.empty
           var ex = intercept[SparkException] {
             db.load(2)
           }
@@ -92,7 +92,7 @@ class RocksDBCheckpointFailureIngestionSuite extends StreamTest
           )
 
           db.load(0)
-            FailureIngestionFileSystem.shouldFailExist = true
+            FailureInjectionFileSystem.shouldFailExist = true
           var ex2 = intercept[IOException] {
             db.load(1)
           }
@@ -103,7 +103,7 @@ class RocksDBCheckpointFailureIngestionSuite extends StreamTest
 
   test("Basic RocksDB Zip File Upload Failure Handling") {
     val fmClass = "org.apache.spark.sql.execution.streaming.state." +
-      "FailureIngestionCheckpointFileManager"
+      "FailureInjectionCheckpointFileManager"
     val hadoopConf = new Configuration()
     hadoopConf.set(STREAMING_CHECKPOINT_FILE_MANAGER_CLASS.parent.key, fmClass)
     withTempDir { remoteDir =>
@@ -117,18 +117,18 @@ class RocksDBCheckpointFailureIngestionSuite extends StreamTest
           hadoopConf = hadoopConf
         ) { db =>
           db.put("version", "1.1")
-          db.commit()
+          commitAndGetCheckpointId(db)
 
           db.load(1)
-          FailureIngestionFileSystem.failureCreateAtomicRegex = Seq(".*zip")
+          FailureInjectionFileSystem.failureCreateAtomicRegex = Seq(".*zip")
           db.put("version", "2.1")
           intercept[IOException] {
-            db.commit()
+            commitAndGetCheckpointId(db)
           }
 
           db.load(1)
 
-          FailureIngestionFileSystem.failureCreateAtomicRegex = Seq.empty
+          FailureInjectionFileSystem.failureCreateAtomicRegex = Seq.empty
           var ex = intercept[SparkException] {
             db.load(2)
           }
@@ -141,7 +141,7 @@ class RocksDBCheckpointFailureIngestionSuite extends StreamTest
           )
 
           db.load(0)
-          FailureIngestionFileSystem.shouldFailExist = true
+          FailureInjectionFileSystem.shouldFailExist = true
           var ex2 = intercept[IOException] {
             db.load(1)
           }
@@ -154,11 +154,11 @@ class RocksDBCheckpointFailureIngestionSuite extends StreamTest
   // be killed or write zip file. Only after the later one is successfully committed, it come back
   // and write the zip file.
   // The final validation isn't necessary for V1 but we just would like to make sure
-  // FailureIngestionCheckpointFileManager has correct behavior --  allows zip files to be delayed
+  // FailureInjectionCheckpointFileManager has correct behavior --  allows zip files to be delayed
   // to be written, so that the test for V1 is valid.
   test("Zip File Overwritten by Previous Task Checkpoint V1") {
     val fmClass = "org.apache.spark.sql.execution.streaming.state." +
-      "FailureIngestionCheckpointFileManager"
+      "FailureInjectionCheckpointFileManager"
     val hadoopConf = new Configuration()
     hadoopConf.set(STREAMING_CHECKPOINT_FILE_MANAGER_CLASS.parent.key, fmClass)
     withTempDir { remoteDir =>
@@ -172,24 +172,24 @@ class RocksDBCheckpointFailureIngestionSuite extends StreamTest
           hadoopConf = hadoopConf
         ) { db =>
           db.put("version", "1.1")
-          db.commit()
+          commitAndGetCheckpointId(db)
 
           db.load(1)
-          FailureIngestionFileSystem.createAtomicDelayCloseRegex = Seq(".*zip")
+          FailureInjectionFileSystem.createAtomicDelayCloseRegex = Seq(".*zip")
           db.put("version", "2.1")
           intercept[IOException] {
-            db.commit()
+            commitAndGetCheckpointId(db)
           }
 
-          FailureIngestionFileSystem.createAtomicDelayCloseRegex = Seq.empty
+          FailureInjectionFileSystem.createAtomicDelayCloseRegex = Seq.empty
 
           db.load(1)
 
           db.put("version", "2.2")
-          db.commit()
+          commitAndGetCheckpointId(db)
 
-          assert(FailureIngestionFileSystem.delayedStreams.size == 1)
-          FailureIngestionFileSystem.delayedStreams.foreach(_.close())
+          assert(FailureInjectionFileSystem.delayedStreams.size == 1)
+          FailureInjectionFileSystem.delayedStreams.foreach(_.close())
         }
         withDB(
           remoteDir.getAbsolutePath,
@@ -209,7 +209,7 @@ class RocksDBCheckpointFailureIngestionSuite extends StreamTest
   // and write the zip file.
   test("Zip File Overwritten by Previous Task Checkpoint V2") {
     val fmClass = "org.apache.spark.sql.execution.streaming.state." +
-      "FailureIngestionCheckpointFileManager"
+      "FailureInjectionCheckpointFileManager"
     val hadoopConf = new Configuration()
     hadoopConf.set(STREAMING_CHECKPOINT_FILE_MANAGER_CLASS.parent.key, fmClass)
     withTempDir { remoteDir =>
@@ -225,28 +225,24 @@ class RocksDBCheckpointFailureIngestionSuite extends StreamTest
           enableStateStoreCheckpointIds = true
         ) { db =>
           db.put("version", "1.1")
-          db.commit()
+          val checkpointId1 = commitAndGetCheckpointId(db)
 
-          val checkpointId1 = getCheckpointId(db)
-
-          FailureIngestionFileSystem.createAtomicDelayCloseRegex = Seq(".*zip")
+          FailureInjectionFileSystem.createAtomicDelayCloseRegex = Seq(".*zip")
           db.load(1, checkpointId1)
           db.put("version", "2.1")
           intercept[IOException] {
-            db.commit()
+            commitAndGetCheckpointId(db)
           }
 
-          FailureIngestionFileSystem.createAtomicDelayCloseRegex = Seq.empty
+          FailureInjectionFileSystem.createAtomicDelayCloseRegex = Seq.empty
 
           db.load(1, checkpointId1)
 
           db.put("version", "2.2")
-          db.commit()
+          checkpointId2 = commitAndGetCheckpointId(db)
 
-          checkpointId2 = getCheckpointId(db)
-
-          // assert(FailureIngestionFileSystem.delayedStreams.size == 1)
-          FailureIngestionFileSystem.delayedStreams.foreach(_.close())
+          // assert(FailureInjectionFileSystem.delayedStreams.size == 1)
+          FailureInjectionFileSystem.delayedStreams.foreach(_.close())
         }
         withDB(
           remoteDir.getAbsolutePath,
@@ -267,10 +263,10 @@ class RocksDBCheckpointFailureIngestionSuite extends StreamTest
   // back and write the changelog file.
   // In the end, the test validates that the state store has the value of the old overwriting
   // changelog. This change is not necessary but we would like to be here to ensure that the failure
-  // ingestion codee works properly so that the v2 test result is valid.
+  // Injection codee works properly so that the v2 test result is valid.
   test("Changelog File Overwritten by Previous Task With Changelog Checkpoint V1") {
     val fmClass = "org.apache.spark.sql.execution.streaming.state." +
-      "FailureIngestionCheckpointFileManager"
+      "FailureInjectionCheckpointFileManager"
     val hadoopConf = new Configuration()
     hadoopConf.set(STREAMING_CHECKPOINT_FILE_MANAGER_CLASS.parent.key, fmClass)
     withTempDir { remoteDir =>
@@ -287,25 +283,25 @@ class RocksDBCheckpointFailureIngestionSuite extends StreamTest
           enableStateStoreCheckpointIds = false
         ) { db =>
           db.put("version", "1.1")
-          db.commit()
+          commitAndGetCheckpointId(db)
 
-          FailureIngestionFileSystem.createAtomicDelayCloseRegex = Seq(".*/2\\.changelog")
+          FailureInjectionFileSystem.createAtomicDelayCloseRegex = Seq(".*/2\\.changelog")
 
           db.load(1)
           db.put("version", "2.1")
           intercept[IOException] {
-            db.commit()
+            commitAndGetCheckpointId(db)
           }
 
-          FailureIngestionFileSystem.createAtomicDelayCloseRegex = Seq.empty
+          FailureInjectionFileSystem.createAtomicDelayCloseRegex = Seq.empty
 
           db.load(1)
 
           db.put("version", "2.2")
-          db.commit()
+          commitAndGetCheckpointId(db)
 
-          // assert(FailureIngestionFileSystem.delayedStreams.size == 1)
-          FailureIngestionFileSystem.delayedStreams.foreach(_.close())
+          // assert(FailureInjectionFileSystem.delayedStreams.size == 1)
+          FailureInjectionFileSystem.delayedStreams.foreach(_.close())
 
         }
         withDB(
@@ -327,7 +323,7 @@ class RocksDBCheckpointFailureIngestionSuite extends StreamTest
   // back and write the changelog file.
   test("Changelog File Overwritten by Previous Task With Changelog Checkpoint V2") {
     val fmClass = "org.apache.spark.sql.execution.streaming.state." +
-      "FailureIngestionCheckpointFileManager"
+      "FailureInjectionCheckpointFileManager"
     val hadoopConf = new Configuration()
     hadoopConf.set(STREAMING_CHECKPOINT_FILE_MANAGER_CLASS.parent.key, fmClass)
     withTempDir { remoteDir =>
@@ -345,29 +341,25 @@ class RocksDBCheckpointFailureIngestionSuite extends StreamTest
           enableStateStoreCheckpointIds = true
         ) { db =>
           db.put("version", "1.1")
-          db.commit()
+          val checkpointId1 = commitAndGetCheckpointId(db)
 
-          val checkpointId1 = getCheckpointId(db)
-
-          FailureIngestionFileSystem.createAtomicDelayCloseRegex = Seq(".*/2_.*changelog")
+          FailureInjectionFileSystem.createAtomicDelayCloseRegex = Seq(".*/2_.*changelog")
 
           db.load(1, checkpointId1)
           db.put("version", "2.1")
           intercept[IOException] {
-            db.commit()
+            commitAndGetCheckpointId(db)
           }
 
-          FailureIngestionFileSystem.createAtomicDelayCloseRegex = Seq.empty
+          FailureInjectionFileSystem.createAtomicDelayCloseRegex = Seq.empty
 
           db.load(1, checkpointId1)
 
           db.put("version", "2.2")
-          db.commit()
+          checkpointId2 = commitAndGetCheckpointId(db)
 
-          checkpointId2 = getCheckpointId(db)
-
-          // assert(FailureIngestionFileSystem.delayedStreams.size == 1)
-          FailureIngestionFileSystem.delayedStreams.foreach(_.close())
+          // assert(FailureInjectionFileSystem.delayedStreams.size == 1)
+          FailureInjectionFileSystem.delayedStreams.foreach(_.close())
 
           db.load(1, checkpointId1)
           db.load(2, checkpointId2)
@@ -392,7 +384,7 @@ class RocksDBCheckpointFailureIngestionSuite extends StreamTest
   // break the strong consisstency condidtion guaranteed by V2.
   test("Delay Snapshot V2") {
     val fmClass = "org.apache.spark.sql.execution.streaming.state." +
-      "FailureIngestionCheckpointFileManager"
+      "FailureInjectionCheckpointFileManager"
     val hadoopConf = new Configuration()
     hadoopConf.set(STREAMING_CHECKPOINT_FILE_MANAGER_CLASS.parent.key, fmClass)
     withTempDir { remoteDir =>
@@ -409,9 +401,7 @@ class RocksDBCheckpointFailureIngestionSuite extends StreamTest
           enableStateStoreCheckpointIds = true
         ) { db =>
           db.put("version", "1.1")
-          db.commit()
-
-          val checkpointId1 = getCheckpointId(db)
+          val checkpointId1 = commitAndGetCheckpointId(db)
 
           withDB(
             remoteDir.getAbsolutePath,
@@ -426,17 +416,14 @@ class RocksDBCheckpointFailureIngestionSuite extends StreamTest
 
             db.load(1, checkpointId1)
             db.put("version", "2.2")
-            db.commit()
-            val checkpointId2 = getCheckpointId(db)
+            val checkpointId2 = commitAndGetCheckpointId(db)
 
             db.load(2, checkpointId2)
             db.put("foo", "bar")
-            db.commit()
+            checkpointId3 = commitAndGetCheckpointId(db)
 
             db2.doMaintenance()
           }
-
-          checkpointId3 = getCheckpointId(db)
         }
         withDB(
           remoteDir.getAbsolutePath,
@@ -459,12 +446,12 @@ class RocksDBCheckpointFailureIngestionSuite extends StreamTest
   Seq(false, true).foreach { ifAllowRenameOverwrite =>
     test(s"Job failure with changelog shows up ifAllowRenameOverwrite = $ifAllowRenameOverwrite") {
       val fmClass = "org.apache.spark.sql.execution.streaming.state." +
-        "FailureIngestionCheckpointFileManager"
+        "FailureInjectionCheckpointFileManager"
       val hadoopConf = new Configuration()
       hadoopConf.set(STREAMING_CHECKPOINT_FILE_MANAGER_CLASS.parent.key, fmClass)
       val rocksdbChangelogCheckpointingConfKey =
         RocksDBConf.ROCKSDB_SQL_CONF_NAME_PREFIX + ".changelogCheckpointing.enabled"
-      FailureIngestionFileSystem.allowOverwriteInRename = ifAllowRenameOverwrite
+      FailureInjectionFileSystem.allowOverwriteInRename = ifAllowRenameOverwrite
       withTempDir { checkpointDir =>
         withTempDir { remoteDir =>
           withSQLConf(
@@ -477,7 +464,7 @@ class RocksDBCheckpointFailureIngestionSuite extends StreamTest
                 .agg(count("*"))
                 .as[(Int, Long)]
 
-            FailureIngestionFileSystem.createAtomicDelayCloseRegex = Seq(".*/2_.*changelog")
+            FailureInjectionFileSystem.createAtomicDelayCloseRegex = Seq(".*/2_.*changelog")
 
             // Run the stream with changelog checkpointing disabled.
             testStream(aggregated, Update)(
@@ -494,9 +481,9 @@ class RocksDBCheckpointFailureIngestionSuite extends StreamTest
               },
               AddData(inputData, 3, 1)
             )
-            FailureIngestionFileSystem.delayedStreams.foreach(_.close())
-            FailureIngestionFileSystem.delayedStreams = Seq.empty
-            FailureIngestionFileSystem.createAtomicDelayCloseRegex = Seq.empty
+            FailureInjectionFileSystem.delayedStreams.foreach(_.close())
+            FailureInjectionFileSystem.delayedStreams = Seq.empty
+            FailureInjectionFileSystem.createAtomicDelayCloseRegex = Seq.empty
 
             testStream(aggregated, Update)(
               StartStream(checkpointLocation = checkpointDir.getAbsolutePath,
@@ -516,7 +503,7 @@ class RocksDBCheckpointFailureIngestionSuite extends StreamTest
 
   test("Previous Changelog Overwrite") {
     val fmClass = "org.apache.spark.sql.execution.streaming.state." +
-      "FailureIngestionCheckpointFileManager"
+      "FailureInjectionCheckpointFileManager"
     val hadoopConf = new Configuration()
     hadoopConf.set(STREAMING_CHECKPOINT_FILE_MANAGER_CLASS.parent.key, fmClass)
     val rocksdbChangelogCheckpointingConfKey =
@@ -533,7 +520,7 @@ class RocksDBCheckpointFailureIngestionSuite extends StreamTest
               .agg(count("*"))
               .as[(Int, Long)]
 
-          FailureIngestionFileSystem.createAtomicDelayCloseRegex = Seq(".*/2_.*changelog")
+          FailureInjectionFileSystem.createAtomicDelayCloseRegex = Seq(".*/2_.*changelog")
 
           // Run the stream with changelog checkpointing disabled.
           testStream(aggregated, Update)(
@@ -550,7 +537,7 @@ class RocksDBCheckpointFailureIngestionSuite extends StreamTest
             },
             AddData(inputData, 3, 1)
           )
-          FailureIngestionFileSystem.createAtomicDelayCloseRegex = Seq.empty
+          FailureInjectionFileSystem.createAtomicDelayCloseRegex = Seq.empty
 
           testStream(aggregated, Update)(
             StartStream(checkpointLocation = checkpointDir.getAbsolutePath,
@@ -562,8 +549,8 @@ class RocksDBCheckpointFailureIngestionSuite extends StreamTest
             CheckAnswer((3, 2), (3, 3), (2, 1), (1, 2)),
             StopStream
           )
-          FailureIngestionFileSystem.delayedStreams.foreach(_.close())
-          FailureIngestionFileSystem.delayedStreams = Seq.empty
+          FailureInjectionFileSystem.delayedStreams.foreach(_.close())
+          FailureInjectionFileSystem.delayedStreams = Seq.empty
 
           testStream(aggregated, Update)(
             StartStream(checkpointLocation = checkpointDir.getAbsolutePath,
@@ -582,7 +569,7 @@ class RocksDBCheckpointFailureIngestionSuite extends StreamTest
 
   test("Previous Maintenance Snapshot Checkpoint Overwrite") {
     val fmClass = "org.apache.spark.sql.execution.streaming.state." +
-      "FailureIngestionCheckpointFileManager"
+      "FailureInjectionCheckpointFileManager"
     val hadoopConf = new Configuration()
     hadoopConf.set(STREAMING_CHECKPOINT_FILE_MANAGER_CLASS.parent.key, fmClass)
     val rocksdbChangelogCheckpointingConfKey =
@@ -599,7 +586,7 @@ class RocksDBCheckpointFailureIngestionSuite extends StreamTest
               .agg(count("*"))
               .as[(Int, Long)]
 
-          FailureIngestionFileSystem.createAtomicDelayCloseRegex = Seq(".*/*zip")
+          FailureInjectionFileSystem.createAtomicDelayCloseRegex = Seq(".*/*zip")
 
           // Run the stream with changelog checkpointing disabled.
           testStream(aggregated, Update)(
@@ -616,13 +603,13 @@ class RocksDBCheckpointFailureIngestionSuite extends StreamTest
             AddData(inputData, 1),
             CheckAnswer((3, 1), (3, 3), (2, 1), (1, 1), (1, 2)),
             Execute { _ =>
-              while (FailureIngestionFileSystem.delayedStreams.isEmpty) {
+              while (FailureInjectionFileSystem.delayedStreams.isEmpty) {
                 Thread.sleep(1)
               }
             },
             StopStream
           )
-          FailureIngestionFileSystem.createAtomicDelayCloseRegex = Seq.empty
+          FailureInjectionFileSystem.createAtomicDelayCloseRegex = Seq.empty
 
           testStream(aggregated, Update)(
             StartStream(checkpointLocation = checkpointDir.getAbsolutePath,
@@ -634,8 +621,8 @@ class RocksDBCheckpointFailureIngestionSuite extends StreamTest
             CheckAnswer((3, 2), (3, 3), (2, 1), (1, 2)),
             StopStream
           )
-          FailureIngestionFileSystem.delayedStreams.foreach(_.close())
-          FailureIngestionFileSystem.delayedStreams = Seq.empty
+          FailureInjectionFileSystem.delayedStreams.foreach(_.close())
+          FailureInjectionFileSystem.delayedStreams = Seq.empty
 
           testStream(aggregated, Update)(
             StartStream(checkpointLocation = checkpointDir.getAbsolutePath,
@@ -652,8 +639,8 @@ class RocksDBCheckpointFailureIngestionSuite extends StreamTest
     }
   }
 
-  def getCheckpointId(db: RocksDB): Option[String] = {
-    val ci = db.getLatestCheckpointInfo(0)
+  def commitAndGetCheckpointId(db: RocksDB): Option[String] = {
+    val (v, ci) = db.commit()
     ci.stateStoreCkptId
   }
 
@@ -667,14 +654,15 @@ class RocksDBCheckpointFailureIngestionSuite extends StreamTest
       func: RocksDB => T): T = {
     var db: RocksDB = null
     try {
-      db = FailureIngestionRocksDBStateStoreProvider.createRocksDBWithFaultIngestion(
+      db = FailureInjectionRocksDBStateStoreProvider.createRocksDBWithFaultInjection(
         remoteDir,
         conf = conf,
         localRootDir = Utils.createTempDir(),
         hadoopConf = hadoopConf,
         loggingId = s"[Thread-${Thread.currentThread.getId}]",
         useColumnFamilies = false,
-        enableStateStoreCheckpointIds = enableStateStoreCheckpointIds)
+        enableStateStoreCheckpointIds = enableStateStoreCheckpointIds,
+        partitionId = 0)
       db.load(version, checkpointId)
       func(db)
     } finally {
