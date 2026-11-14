@@ -198,18 +198,31 @@ class MicroBatchExecution(
   // The rewrites of the filters that the scans of the sources got, which the micro-batches check.
   private val pushedFilterRewrites = new StreamingV2ScanPushDown.PushedFilterRewrites
 
+  private val joinEventTimeColumnRetentionVersionKey =
+    SQLConf.STREAMING_JOIN_EVENT_TIME_COLUMN_RETENTION_VERSION.key
+
+  private def joinEventTimeColumnRetentionVersion(offsets: OffsetSeqBase): Int = {
+    offsets.metadataOpt.flatMap(_.conf.get(joinEventTimeColumnRetentionVersionKey))
+      .map(_.toInt)
+      .getOrElse(streamMetadata.joinEventTimeColumnRetentionVersion.getOrElse(0))
+  }
+
   private def latestOffsetSeqWithRetentionVersion: Option[(Long, OffsetSeqBase)] = {
-    val retentionVersion = streamMetadata.joinEventTimeColumnRetentionVersion.getOrElse(0)
-    val key = SQLConf.STREAMING_JOIN_EVENT_TIME_COLUMN_RETENTION_VERSION.key
     offsetLog.getLatest().map { case (batchId, offsets) =>
+      val retentionVersion = joinEventTimeColumnRetentionVersion(offsets)
       val updatedOffsets = offsets match {
-        case seq: OffsetSeq =>
+        case seq: OffsetSeq if seq.metadataOpt.exists(
+            !_.conf.contains(joinEventTimeColumnRetentionVersionKey)) =>
           seq.copy(metadataOpt = seq.metadataOpt.map { metadata =>
-            metadata.copy(conf = metadata.conf.updated(key, retentionVersion.toString))
+            metadata.copy(conf = metadata.conf.updated(
+              joinEventTimeColumnRetentionVersionKey, retentionVersion.toString))
           })
-        case map: OffsetMap =>
+        case map: OffsetMap
+            if !map.metadata.conf.contains(joinEventTimeColumnRetentionVersionKey) =>
           map.copy(metadata = map.metadata.copy(
-            conf = map.metadata.conf.updated(key, retentionVersion.toString)))
+            conf = map.metadata.conf.updated(
+              joinEventTimeColumnRetentionVersionKey, retentionVersion.toString)))
+        case _ => offsets
       }
       batchId -> updatedOffsets
     }
@@ -230,9 +243,18 @@ class MicroBatchExecution(
       "logicalPlan must be initialized in QueryExecutionThread " +
         s"but the current thread was ${Thread.currentThread}")
     val streamConf = sparkSessionForStream.sessionState.conf
+    // Once an offset records this version, it is authoritative. StreamMetadata is only the
+    // fallback before batch 0 and for an offset written by an older binary that omitted the key.
+    // The fallback cannot distinguish an uncommitted offset from legacy state committed by that
+    // binary. Therefore, new -> old -> new is not generally compatible: the final upgrade can fail
+    // state-schema validation. Supporting downgrade requires the old binary to understand this
+    // version, so retain the query-level choice here instead of guessing version 0.
+    val retentionVersion = initialLatestOffsetSeq.map { case (_, offsets) =>
+      joinEventTimeColumnRetentionVersion(offsets)
+    }.getOrElse(streamMetadata.joinEventTimeColumnRetentionVersion.getOrElse(0))
     streamConf.setConf(
       SQLConf.STREAMING_JOIN_EVENT_TIME_COLUMN_RETENTION_VERSION,
-      streamMetadata.joinEventTimeColumnRetentionVersion.getOrElse(0))
+      retentionVersion)
     val nextSourceId = new AtomicLong(0L)
     val toExecutionRelationMap = MutableMap[StreamingRelation, StreamingExecutionRelation]()
     val v2ToExecutionRelationMap = MutableMap[StreamingRelationV2, StreamingExecutionRelation]()

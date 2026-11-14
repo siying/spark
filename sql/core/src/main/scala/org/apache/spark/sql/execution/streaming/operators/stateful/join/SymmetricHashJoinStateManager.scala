@@ -242,7 +242,6 @@ class SymmetricHashJoinStateManagerV4(
     snapshotOptions: Option[SnapshotOptions] = None,
     joinStoreGenerator: JoinStateManagerStoreGenerator,
     joinKeyOrdinalForWatermark: Option[Int] = None,
-    useEventTimeIndex: Option[Boolean] = None,
     readOnly: Boolean = false)
   extends SymmetricHashJoinStateManager with SupportsEvictByTimestamp with Logging {
 
@@ -261,15 +260,15 @@ class SymmetricHashJoinStateManagerV4(
     // pass the information. The information is in SQLConf.
     allowMultipleEventTimeColumns = false)
 
-  // The execution operator knows whether this side has an eviction predicate. Other callers that
-  // do not have that information keep the legacy inference from the available event-time fields.
-  private val hasEventTime: Boolean = useEventTimeIndex.getOrElse(
-    eventTimeColIdxOpt.isDefined || joinKeyOrdinalForWatermark.isDefined)
+  // Whether event time is present is part of V4's durable primary-key layout. It must not depend
+  // on whether the current query can derive an eviction predicate, which may change on restart.
+  private val hasEventTime: Boolean =
+    eventTimeColIdxOpt.isDefined || joinKeyOrdinalForWatermark.isDefined
 
   private val random = new scala.util.Random(System.currentTimeMillis())
   private val bucketCountForNoEventTime = 1024
   private val extractEventTimeFn: UnsafeRow => Long = { row =>
-    eventTimeColIdxOpt.filter(_ => hasEventTime) match {
+    eventTimeColIdxOpt match {
       case Some(idx) =>
         val attr = inputValueAttributes(idx)
 
@@ -290,7 +289,7 @@ class SymmetricHashJoinStateManagerV4(
   }
 
   private val extractEventTimeFnFromKey: UnsafeRow => Option[Long] = { row =>
-    joinKeyOrdinalForWatermark.filter(_ => hasEventTime).map { idx =>
+    joinKeyOrdinalForWatermark.map { idx =>
       val attr = keyAttributes(idx)
       if (attr.dataType.isInstanceOf[StructType]) {
         // NOTE: We assume this is window struct, as same as WatermarkSupport.watermarkExpression
@@ -2179,14 +2178,13 @@ object SymmetricHashJoinStateManager {
       snapshotOptions: Option[SnapshotOptions] = None,
       joinStoreGenerator: JoinStateManagerStoreGenerator,
       joinKeyOrdinalForWatermark: Option[Int] = None,
-      useEventTimeIndex: Option[Boolean] = None,
       readOnly: Boolean = false): SymmetricHashJoinStateManager = {
     if (stateFormatVersion == 4) {
       new SymmetricHashJoinStateManagerV4(
         joinSide, inputValueAttributes, joinKeys, stateInfo, storeConf, hadoopConf,
         partitionId, keyToNumValuesStateStoreCkptId, keyWithIndexToValueStateStoreCkptId,
         stateFormatVersion, skippedNullValueCount, useStateStoreCoordinator, snapshotOptions,
-        joinStoreGenerator, joinKeyOrdinalForWatermark, useEventTimeIndex, readOnly
+        joinStoreGenerator, joinKeyOrdinalForWatermark, readOnly
       )
     } else if (stateFormatVersion == 3) {
       new SymmetricHashJoinStateManagerV2(

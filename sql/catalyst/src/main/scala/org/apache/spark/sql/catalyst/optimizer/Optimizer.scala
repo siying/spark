@@ -1520,7 +1520,8 @@ object ColumnPruning extends Rule[LogicalPlan] {
     val statefulJoins = plan.collect { case join: Join if join.isStateful => join }
     val preserveJoinEventTime =
       conf.getConf(SQLConf.STREAMING_JOIN_EVENT_TIME_COLUMN_RETENTION_VERSION) == 1 &&
-        statefulJoins.size == 1
+        (statefulJoins.size == 1 ||
+          (statefulJoins.nonEmpty && statefulJoins.forall(_.useRetainedEventTimeColumn)))
     statefulJoins.foreach(_.setUseRetainedEventTimeColumn(preserveJoinEventTime))
 
     removeProjectBeforeFilter(plan.transformWithPruning(AlwaysProcess.fn, ruleId) {
@@ -1583,7 +1584,7 @@ object ColumnPruning extends Rule[LogicalPlan] {
 
     // Eliminate unneeded attributes from right side of a Left Existence Join.
     case j @ Join(_, right, LeftExistence(_), _, _) =>
-      j.copy(right = prunedChild(right, requiredInputReferences(j, preserveJoinEventTime)))
+      j.copy(right = prunedChild(right, requiredInputReferences(j)))
 
     // An external lookup join keeps only the lookup columns that its parent reads. Its lookup side
     // is pruned to them in the next pass, once the join no longer references the others.
@@ -1652,7 +1653,7 @@ object ColumnPruning extends Rule[LogicalPlan] {
     // for all other logical plans that inherits the output from it's children
     // Project over project is handled by the first case, skip it here.
     case p @ Project(_, child) if !child.isInstanceOf[Project] =>
-      val required = requiredInputReferences(child, preserveJoinEventTime) ++ p.references
+      val required = requiredInputReferences(child) ++ p.references
       if (!child.inputSet.subsetOf(required)) {
         val newChildren = child.children.map(c => prunedChild(c, required))
         p.copy(child = child.withNewChildren(newChildren))
@@ -1662,11 +1663,9 @@ object ColumnPruning extends Rule[LogicalPlan] {
     })
   }
 
-  private def requiredInputReferences(
-      plan: LogicalPlan,
-      preserveJoinEventTime: Boolean): AttributeSet = {
+  private def requiredInputReferences(plan: LogicalPlan): AttributeSet = {
     val eventTimeAttributes = plan match {
-      case join: Join if join.isStateful && preserveJoinEventTime =>
+      case join: Join if join.isStateful && join.useRetainedEventTimeColumn =>
         join.children.flatMap { child =>
           val eventTimeColumns = child.output.filter(
             _.metadata.contains(EventTimeWatermark.delayKey))

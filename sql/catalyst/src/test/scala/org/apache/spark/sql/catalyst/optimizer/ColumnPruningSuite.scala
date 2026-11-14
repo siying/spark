@@ -40,6 +40,16 @@ class ColumnPruningSuite extends PlanTest {
       CollapseProject) :: Nil
   }
 
+  object OptimizeJoinThroughUnion extends RuleExecutor[LogicalPlan] {
+    val batches =
+      Batch("Initial column pruning", Once,
+        ColumnPruning,
+        PushProjectionThroughUnion,
+        CollapseProject) ::
+      Batch("Push down join", Once, PushDownJoinThroughUnion(SQLConf.get)) ::
+      Batch("Final column pruning", Once, ColumnPruning) :: Nil
+  }
+
   test("Column pruning for an external lookup join keeps the lookup columns its parent reads") {
     val stream = LocalRelation($"id".int, $"label".string)
     val lookup = LocalRelation($"key".int, $"value".string, $"extra".string)
@@ -560,6 +570,27 @@ class ColumnPruningSuite extends PlanTest {
     }
   }
 
+  test("SPARK-60850: join pushdown through union preserves the retention decision") {
+    val (left, right) = watermarkedJoinInputs()
+    val union = Union(Seq(left, left.newInstance()))
+    val hint = JoinHint(None, Some(HintInfo(Some(BROADCAST))))
+    val join = Join(union, right, Inner,
+      Some(union.output.head === right.output.head), hint)
+    val query = Project(union.output, join)
+    withSQLConf(
+        SQLConf.STREAMING_JOIN_EVENT_TIME_COLUMN_RETENTION_VERSION.key -> "1",
+        SQLConf.PUSH_DOWN_JOIN_THROUGH_UNION_ENABLED.key -> "true") {
+      val optimized = OptimizeJoinThroughUnion.execute(query)
+      val joins = optimized.collect { case join: Join => join }
+      assert(joins.size == 2)
+      assert(joins.forall(_.useRetainedEventTimeColumn))
+      joins.foreach { join =>
+        assert(join.left.output.exists(_.metadata.contains(EventTimeWatermark.delayKey)))
+        assert(join.right.output.exists(_.metadata.contains(EventTimeWatermark.delayKey)))
+      }
+    }
+  }
+
   test("SPARK-60850: column pruning does not resurrect explicitly removed event time") {
     val (left, right) = watermarkedJoinInputs()
     val projected = Project(Seq(left.output.head, left.output(2)), left)
@@ -594,7 +625,7 @@ class ColumnPruningSuite extends PlanTest {
     }
   }
 
-  test("SPARK-60850: ambiguous event-time inputs are outside the retention POC") {
+  test("SPARK-60850: ambiguous event-time inputs are not retained") {
     val (left, right) = watermarkedJoinInputs()
     val otherTime = AttributeReference("otherTime", TimestampType,
       metadata = left.output(1).metadata)()
@@ -609,7 +640,7 @@ class ColumnPruningSuite extends PlanTest {
     }
   }
 
-  test("SPARK-60850: window-valued event time is outside the retention POC") {
+  test("SPARK-60850: window-valued event time is not retained") {
     val (left, right) = watermarkedJoinInputs()
     val windowType = new StructType().add("start", TimestampType).add("end", TimestampType)
     val window = AttributeReference("window", windowType, metadata = left.output(1).metadata)()

@@ -23,14 +23,17 @@ import org.apache.spark.internal.Logging
 import org.apache.spark.internal.LogKeys.{ANALYSIS_ERROR, QUERY_PLAN}
 import org.apache.spark.sql.AnalysisException
 import org.apache.spark.sql.catalyst.ExtendedAnalysisException
-import org.apache.spark.sql.catalyst.expressions.{Attribute, AttributeReference, CurrentDate, CurrentTimestampLike, Expression, GroupingSets, LocalTimestamp, LocalTimestampNanos, MonotonicallyIncreasingID, NamedExpression, SessionWindow, WindowExpression}
+import org.apache.spark.sql.catalyst.expressions.{Attribute, AttributeReference, AttributeSet, CurrentDate, CurrentTimestampLike, Expression, GroupingSets, LocalTimestamp, LocalTimestampNanos, MonotonicallyIncreasingID, NamedExpression, SessionWindow, WindowExpression}
 import org.apache.spark.sql.catalyst.expressions.aggregate.AggregateExpression
+import org.apache.spark.sql.catalyst.optimizer.ColumnPruning
 import org.apache.spark.sql.catalyst.plans._
 import org.apache.spark.sql.catalyst.plans.logical._
 import org.apache.spark.sql.catalyst.streaming.InternalOutputModes
 import org.apache.spark.sql.errors.{QueryCompilationErrors, QueryExecutionErrors}
 import org.apache.spark.sql.internal.SQLConf
 import org.apache.spark.sql.streaming.{GroupStateTimeout, OutputMode}
+import org.apache.spark.sql.types.TimestampType
+import org.apache.spark.util.Utils
 
 /**
  * Analyzes the presence of unsupported operations in a logical plan.
@@ -218,6 +221,13 @@ object UnsupportedOperationChecker extends Logging {
     val flatMapGroupsWithStates = plan.collect {
       case f: FlatMapGroupsWithState if f.isStreaming && !f.isMapGroupsWithState => f
     }
+
+    val columnPruningEnabled = !SQLConf.get.optimizerExcludedRules.toSeq
+      .flatMap(Utils.stringToSeq).contains(ColumnPruning.ruleName)
+    val useRetainedJoinEventTimeColumn =
+      SQLConf.get.getConf(SQLConf.STREAMING_JOIN_EVENT_TIME_COLUMN_RETENTION_VERSION) == 1 &&
+        columnPruningEnabled &&
+        plan.collect { case join: Join if join.isStateful => join }.size == 1
 
     // Disallow mixing `mapGroupsWithState`s and `flatMapGroupsWithState`s
     if (mapGroupsWithStates.nonEmpty && flatMapGroupsWithStates.nonEmpty) {
@@ -525,7 +535,7 @@ object UnsupportedOperationChecker extends Logging {
                 throwError("FullOuter joins with streaming DataFrames/Datasets on the right " +
                   "and a static DataFrame/Dataset on the left is not supported")
               } else if (left.isStreaming && right.isStreaming) {
-                checkForStreamStreamJoinWatermark(j)
+                checkForStreamStreamJoinWatermark(j, useRetainedJoinEventTimeColumn)
               }
 
             case LeftAnti =>
@@ -541,7 +551,7 @@ object UnsupportedOperationChecker extends Logging {
                 throwError(s"$joinType join with a streaming DataFrame/Dataset " +
                   "on the right and a static DataFrame/Dataset on the left is not supported")
               } else if (left.isStreaming && right.isStreaming) {
-                checkForStreamStreamJoinWatermark(j)
+                checkForStreamStreamJoinWatermark(j, useRetainedJoinEventTimeColumn)
               }
 
             // We support streaming right outer joins with static on the left always, and with
@@ -551,7 +561,7 @@ object UnsupportedOperationChecker extends Logging {
                 throwError("RightOuter join with a streaming DataFrame/Dataset on the left and " +
                     "a static DataFrame/DataSet on the right not supported")
               } else if (left.isStreaming && right.isStreaming) {
-                checkForStreamStreamJoinWatermark(j)
+                checkForStreamStreamJoinWatermark(j, useRetainedJoinEventTimeColumn)
               }
 
             case NaturalJoin(_) | UsingJoin(_, _) =>
@@ -705,19 +715,37 @@ object UnsupportedOperationChecker extends Logging {
       plan = operator)
   }
 
-  private def checkForStreamStreamJoinWatermark(join: Join): Unit = {
+  private def checkForStreamStreamJoinWatermark(
+      join: Join,
+      useRetainedEventTimeColumn: Boolean): Unit = {
     val watermarkInJoinKeys = StreamingJoinHelper.isWatermarkInJoinKeys(join)
 
+    def attributesForStateWatermark(plan: LogicalPlan): AttributeSet = {
+      val eventTimeColumns = plan.output.filter(
+        _.metadata.contains(EventTimeWatermark.delayKey))
+      if (useRetainedEventTimeColumn &&
+          eventTimeColumns.map(_.exprId).distinct.size == 1 &&
+          eventTimeColumns.head.dataType == TimestampType) {
+        AttributeSet(eventTimeColumns)
+      } else {
+        plan.outputSet
+      }
+    }
+
     // Check if the nullable side has a watermark, and there's a range condition which
-    // implies a state value watermark on the first side.
+    // implies a state value watermark on the first side. Version 1 must use the same retained
+    // event-time attribute as execution; accepting a range on another timestamp would leave outer
+    // or semi rows buffered forever because execution cannot derive their eviction predicate.
     val hasValidWatermarkRange = join.joinType match {
       case LeftOuter | LeftSemi => StreamingJoinHelper.getStateValueWatermark(
-        join.left.outputSet, join.right.outputSet, join.condition, Some(1000000)).isDefined
+        attributesForStateWatermark(join.left), join.right.outputSet,
+        join.condition, Some(1000000)).isDefined
       case RightOuter => StreamingJoinHelper.getStateValueWatermark(
-        join.right.outputSet, join.left.outputSet, join.condition, Some(1000000)).isDefined
+        attributesForStateWatermark(join.right), join.left.outputSet,
+        join.condition, Some(1000000)).isDefined
       case FullOuter =>
-        Seq((join.left.outputSet, join.right.outputSet),
-          (join.right.outputSet, join.left.outputSet)).exists {
+        Seq((attributesForStateWatermark(join.left), join.right.outputSet),
+          (attributesForStateWatermark(join.right), join.left.outputSet)).exists {
           case (attributesToFindStateWatermarkFor, attributesWithEventWatermark) =>
             StreamingJoinHelper.getStateValueWatermark(attributesToFindStateWatermarkFor,
               attributesWithEventWatermark, join.condition, Some(1000000)).isDefined

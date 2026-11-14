@@ -342,7 +342,8 @@ abstract class StreamingInnerJoinBase extends StreamingJoinSuite {
     (0, true, false, false),
     (0, false, false, true),
     (1, false, false, false),
-    (1, false, true, false)
+    (1, false, true, false),
+    (1, false, false, true)
   ).foreach { case (version, legacyCheckpoint, strippedByOldBinary, excludeColumnPruning) =>
     test(s"SPARK-60850: pinned join event time (version=$version, " +
         s"legacy=$legacyCheckpoint, stripped=$strippedByOldBinary, " +
@@ -488,6 +489,69 @@ abstract class StreamingInnerJoinBase extends StreamingJoinSuite {
           CheckNewAnswer(lateLeft: _*),
           AddData(rightInput, (2, 0)),
           CheckNewAnswer(lateRight: _*),
+          StopStream)
+      }
+    }
+  }
+
+  Seq(
+    "missing" -> None,
+    "conflicting" -> Some(0)
+  ).foreach { case (metadataCase, streamMetadataVersion) =>
+    test(s"SPARK-60850: offset retention version overrides $metadataCase stream metadata") {
+      withTempDir { checkpoint =>
+        val entry = SQLConf.STREAMING_JOIN_EVENT_TIME_COLUMN_RETENTION_VERSION
+        val leftInput = MemoryStream[(Int, Int)]
+        val rightInput = MemoryStream[(Int, Int)]
+        val left = leftInput.toDF().toDF("key", "seconds")
+          .select($"key", timestamp_seconds($"seconds").as("leftTime"))
+          .withWatermark("leftTime", "5 seconds")
+        val right = rightInput.toDF().toDF("key", "seconds")
+          .select($"key", timestamp_seconds($"seconds").as("rightTime"))
+          .withWatermark("rightTime", "5 seconds")
+        val joined = left.join(right, "key").select("key")
+        val checkpointLocation = checkpoint.getCanonicalPath
+
+        testStream(joined)(
+          StartStream(
+            additionalConfs = Map(entry.key -> "1"),
+            checkpointLocation = checkpointLocation),
+          AddData(leftInput, (1, 20)),
+          CheckAnswer(),
+          AddData(rightInput, (1, 20)),
+          CheckNewAnswer(1),
+          StopStream)
+
+        val metadataPath = new Path(checkpointLocation, "metadata")
+        val hadoopConf = spark.sessionState.newHadoopConf()
+        val metadata = StreamMetadata.read(metadataPath, hadoopConf).get
+        val fs = metadataPath.getFileSystem(hadoopConf)
+        assert(fs.delete(metadataPath, false))
+        StreamMetadata.write(
+          metadata.copy(joinEventTimeColumnRetentionVersion = streamMetadataVersion),
+          metadataPath,
+          hadoopConf)
+
+        def checkOffsetPrecedence(query: StreamExecution): Unit = {
+          assert(query.streamMetadata.joinEventTimeColumnRetentionVersion == streamMetadataVersion)
+          assert(query.sparkSessionForStream.conf.get(entry.key) == "1")
+          assert(query.offsetLog.getLatest().get._2.metadataOpt.get
+            .conf.get(entry.key).contains("1"))
+          val join = query.lastExecution.executedPlan.collectFirst {
+            case join: StreamingSymmetricHashJoinExec => join
+          }.get
+          assert(join.useRetainedEventTimeColumn)
+        }
+
+        testStream(joined)(
+          StartStream(
+            additionalConfs = Map(entry.key -> "0"),
+            checkpointLocation = checkpointLocation),
+          AddData(leftInput, (2, 30)),
+          CheckAnswer(),
+          Execute(checkOffsetPrecedence),
+          AddData(rightInput, (2, 30)),
+          CheckNewAnswer(2),
           StopStream)
       }
     }
@@ -1715,40 +1779,6 @@ abstract class StreamingOuterJoinBase extends StreamingJoinSuite {
 
   private object RestartMode extends Enumeration {
     val WithoutRestart, WithRestart = Value
-  }
-
-  test("SPARK-60850: retained event time does not emit a premature outer row") {
-    withSQLConf(SQLConf.STREAMING_JOIN_EVENT_TIME_COLUMN_RETENTION_VERSION.key -> "1") {
-      val leftInput = MemoryStream[(Int, Int, Int)]
-      val rightInput = MemoryStream[(Int, Int)]
-      val left = leftInput.toDF().toDF("key", "eventSeconds", "joinSeconds")
-        .select(
-          $"key".as("leftKey"),
-          timestamp_seconds($"eventSeconds").as("leftEventTime"),
-          timestamp_seconds($"joinSeconds").as("leftJoinTime"))
-        .withWatermark("leftEventTime", "5 seconds")
-      val right = rightInput.toDF().toDF("key", "eventSeconds")
-        .select(
-          $"key".as("rightKey"),
-          timestamp_seconds($"eventSeconds").as("rightEventTime"))
-        .withWatermark("rightEventTime", "5 seconds")
-      val joined = left.join(right,
-        left("leftKey") === right("rightKey") &&
-          left("leftJoinTime") > right("rightEventTime"), "left_outer")
-        .select(left("leftKey"), right("rightKey"))
-
-      testStream(joined)(
-        AddData(leftInput, (1, 20, 200)),
-        CheckAnswer(),
-        AddData(rightInput, (9, 20)),
-        CheckAnswer(),
-        AddData(leftInput, (8, 100, 100)),
-        CheckAnswer(),
-        AddData(rightInput, (7, 100)),
-        CheckAnswer(),
-        AddData(rightInput, (1, 150)),
-        CheckNewAnswer((1, 1)))
-    }
   }
 
   for {

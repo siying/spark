@@ -95,7 +95,11 @@ case class PushDownJoinThroughUnion(override val conf: SQLConf)
       case a: Attribute if leftRewrites.contains(a) => leftRewrites(a)
       case a: Attribute if rightRewrites.contains(a) => rightRewrites(a)
     })
-    Join(child, newRight, join.joinType, newCond, join.hint)
+    val branch = Join(child, newRight, join.joinType, newCond, join.hint)
+    // The transform replaces the original Join with a Union, so TreeNode's automatic tag copying
+    // targets the Union rather than the equivalent Join created for each branch.
+    branch.setUseRetainedEventTimeColumn(join.useRetainedEventTimeColumn)
+    branch
   }
 
   /**

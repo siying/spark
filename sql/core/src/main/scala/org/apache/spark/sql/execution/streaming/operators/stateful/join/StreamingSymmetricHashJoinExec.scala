@@ -151,6 +151,9 @@ case class StreamingSymmetricHashJoinExec(
     useRetainedEventTimeColumn: Boolean = false)
     extends BinaryExecNode with StateStoreWriter with SchemaValidationUtils {
 
+  // This flag only changes internal watermark derivation. Keep it out of EXPLAIN output.
+  override protected def stringArgs: Iterator[Any] = super.stringArgs.toSeq.dropRight(1).iterator
+
   def this(
       leftKeys: Seq[Expression],
       rightKeys: Seq[Expression],
@@ -712,12 +715,7 @@ case class StreamingSymmetricHashJoinExec(
       stateFormatVersion = stateFormatVersion,
       skippedNullValueCount = skippedNullValueCount,
       joinStoreGenerator = joinStateManagerStoreGenerator,
-      joinKeyOrdinalForWatermark = joinKeyOrdinalForWatermark,
-      useEventTimeIndex = if (useRetainedEventTimeColumn) {
-        Some(stateWatermarkPredicate.isDefined)
-      } else {
-        None
-      })
+      joinKeyOrdinalForWatermark = joinKeyOrdinalForWatermark)
 
     private[this] val keyGenerator = UnsafeProjection.create(joinKeys, inputAttributes)
 

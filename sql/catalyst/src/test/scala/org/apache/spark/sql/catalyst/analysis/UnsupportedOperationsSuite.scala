@@ -26,12 +26,13 @@ import org.apache.spark.sql.catalyst.dsl.plans._
 import org.apache.spark.sql.catalyst.encoders.ExpressionEncoder
 import org.apache.spark.sql.catalyst.expressions.{Attribute, AttributeReference, Expression, MonotonicallyIncreasingID, NamedExpression}
 import org.apache.spark.sql.catalyst.expressions.aggregate.Count
+import org.apache.spark.sql.catalyst.optimizer.ColumnPruning
 import org.apache.spark.sql.catalyst.plans._
 import org.apache.spark.sql.catalyst.plans.logical._
 import org.apache.spark.sql.catalyst.streaming.InternalOutputModes._
 import org.apache.spark.sql.internal.SQLConf
 import org.apache.spark.sql.streaming.{GroupStateTimeout, OutputMode, StatefulProcessor, TimeMode, TimerValues}
-import org.apache.spark.sql.types.{IntegerType, LongType, MetadataBuilder, StructType}
+import org.apache.spark.sql.types.{IntegerType, LongType, MetadataBuilder, StructType, TimestampType}
 
 /** A dummy command for testing unsupported operations. */
 case class DummyCommand() extends LeafCommand
@@ -557,6 +558,35 @@ class UnsupportedOperationsSuite extends SparkFunSuite with SQLHelper {
       OutputMode.Append(),
       Seq("is not supported without a watermark in the join keys, or a watermark on " +
         "the nullable side and an appropriate range condition"))
+  }
+
+  test("SPARK-60850: retained event time must derive the outer join state watermark") {
+    val leftEventTime = AttributeReference(
+      "leftEventTime", TimestampType, metadata = watermarkMetadata)()
+    val leftJoinTime = AttributeReference("leftJoinTime", TimestampType)()
+    val rightEventTime = AttributeReference(
+      "rightEventTime", TimestampType, metadata = watermarkMetadata)()
+    val left = TestStreamingRelation(Seq(attribute, leftEventTime, leftJoinTime))
+    val right = TestStreamingRelation(Seq(attribute.newInstance(), rightEventTime))
+    val join = left.join(right, joinType = LeftOuter,
+      condition = Some(leftJoinTime > rightEventTime))
+
+    withSQLConf(SQLConf.STREAMING_JOIN_EVENT_TIME_COLUMN_RETENTION_VERSION.key -> "0") {
+      UnsupportedOperationChecker.checkForStreaming(wrapInStreaming(join), OutputMode.Append())
+    }
+    withSQLConf(SQLConf.STREAMING_JOIN_EVENT_TIME_COLUMN_RETENTION_VERSION.key -> "1") {
+      val error = intercept[AnalysisException] {
+        UnsupportedOperationChecker.checkForStreaming(wrapInStreaming(join), OutputMode.Append())
+      }
+      assert(error.getMessage.contains(
+        "is not supported without a watermark in the join keys, or a watermark on " +
+          "the nullable side and an appropriate range condition"))
+    }
+    withSQLConf(
+        SQLConf.STREAMING_JOIN_EVENT_TIME_COLUMN_RETENTION_VERSION.key -> "1",
+        SQLConf.OPTIMIZER_EXCLUDED_RULES.key -> ColumnPruning.ruleName) {
+      UnsupportedOperationChecker.checkForStreaming(wrapInStreaming(join), OutputMode.Append())
+    }
   }
 
   // multi-aggregations only supported in Append mode

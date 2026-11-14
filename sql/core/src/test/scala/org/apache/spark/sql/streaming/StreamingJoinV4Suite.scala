@@ -310,7 +310,7 @@ class StreamingInnerJoinV4Suite
   }
 
   testWithVirtualColumnFamilyJoins(
-    "SPARK-60850: retained event time does not populate an unevictable secondary index") {
+    "SPARK-60850: retained event time preserves the V4 timestamp layout") {
     withTempDir { checkpointDir =>
       val leftInput = MemoryStream[(Int, Int)]
       val rightInput = MemoryStream[(Int, Int)]
@@ -334,8 +334,8 @@ class StreamingInnerJoinV4Suite
           val checkpointLoc = checkpointDir.getCanonicalPath
           assert(readStateStore(checkpointLoc, "left-keyWithTsToValues") > 0)
           assert(readStateStore(checkpointLoc, "right-keyWithTsToValues") > 0)
-          assert(readStateStore(checkpointLoc, "left-tsWithKey") === 0)
-          assert(readStateStore(checkpointLoc, "right-tsWithKey") === 0)
+          assert(readStateStore(checkpointLoc, "left-tsWithKey") > 0)
+          assert(readStateStore(checkpointLoc, "right-tsWithKey") > 0)
         },
         StopStream)
     }
@@ -405,8 +405,10 @@ class StreamingInnerJoinV4Suite
         .select($"rightKey", timestamp_seconds($"time") as "rightTime",
           ($"rightKey" * 3) as "rightValue")
       // Only left side has watermark; watermark is on a value column, not the join key.
-      // Neither side can actually evict because the right input has no watermark. The secondary
-      // indexes therefore remain empty even though the left input has an event-time attribute.
+      // joinKeyOrdinalForWatermark is None -> only left has hasEventTime = true.
+      // Neither side can actually evict: the left state watermark is derived from the right
+      // side's watermark via the join condition, which is absent here. The left secondary
+      // index is populated but never used for eviction.
 
       val joined = df1.join(df2,
         expr("leftKey = rightKey AND " +
@@ -427,10 +429,10 @@ class StreamingInnerJoinV4Suite
           assert(readStateStore(checkpointLoc, "right-keyWithTsToValues") > 0,
             "right primary store should have rows")
 
-          assert(readStateStore(checkpointLoc, "left-tsWithKey") === 0,
-            "left secondary index should be empty without an eviction predicate")
+          assert(readStateStore(checkpointLoc, "left-tsWithKey") > 0,
+            "left secondary index should be populated (watermark on left value column)")
           assert(readStateStore(checkpointLoc, "right-tsWithKey") === 0,
-            "right secondary index should be empty without an eviction predicate")
+            "right secondary index should be empty (no watermark on right side)")
         },
         StopStream
       )
