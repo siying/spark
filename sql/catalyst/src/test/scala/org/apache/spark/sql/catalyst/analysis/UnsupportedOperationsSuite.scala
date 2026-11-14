@@ -581,6 +581,17 @@ class UnsupportedOperationsSuite extends SparkFunSuite with SQLHelper {
       assert(error.getMessage.contains(
         "is not supported without a watermark in the join keys, or a watermark on " +
           "the nullable side and an appropriate range condition"))
+
+      val independentJoin = left.join(right, joinType = Inner,
+        condition = Some(left.output.head === right.output.head))
+      val siblingJoins = Union(Seq(join, independentJoin))
+      val siblingError = intercept[AnalysisException] {
+        UnsupportedOperationChecker.checkForStreaming(
+          wrapInStreaming(siblingJoins), OutputMode.Append())
+      }
+      assert(siblingError.getMessage.contains(
+        "is not supported without a watermark in the join keys, or a watermark on " +
+          "the nullable side and an appropriate range condition"))
     }
     withSQLConf(
         SQLConf.STREAMING_JOIN_EVENT_TIME_COLUMN_RETENTION_VERSION.key -> "1",

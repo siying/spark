@@ -19,7 +19,6 @@ package org.apache.spark.sql.streaming
 
 import java.io.File
 import java.lang.{Integer => JInteger}
-import java.nio.charset.StandardCharsets
 import java.sql.Timestamp
 import java.util.{Locale, UUID}
 
@@ -338,16 +337,14 @@ abstract class StreamingInnerJoinBase extends StreamingJoinSuite {
   import testImplicits._
 
   Seq(
-    (0, false, false, false),
-    (0, true, false, false),
-    (0, false, false, true),
-    (1, false, false, false),
-    (1, false, true, false),
-    (1, false, false, true)
-  ).foreach { case (version, legacyCheckpoint, strippedByOldBinary, excludeColumnPruning) =>
+    (0, false, false),
+    (0, true, false),
+    (0, false, true),
+    (1, false, false),
+    (1, false, true)
+  ).foreach { case (version, legacyCheckpoint, excludeColumnPruning) =>
     test(s"SPARK-60850: pinned join event time (version=$version, " +
-        s"legacy=$legacyCheckpoint, stripped=$strippedByOldBinary, " +
-        s"excluded=$excludeColumnPruning)") {
+        s"legacy=$legacyCheckpoint, excluded=$excludeColumnPruning)") {
       withTempDir { checkpoint =>
         val entry = SQLConf.STREAMING_JOIN_EVENT_TIME_COLUMN_RETENTION_VERSION
         val excludedRules = if (excludeColumnPruning) ColumnPruning.ruleName else ""
@@ -390,11 +387,11 @@ abstract class StreamingInnerJoinBase extends StreamingJoinSuite {
             case _: MicroBatchScanExec => true
           }.nonEmpty)
           assert(query.sparkSessionForStream.conf.get(entry.key) == version.toString)
-          assert(query.streamMetadata.joinEventTimeColumnRetentionVersion.getOrElse(0) == version)
-          if (!strippedByOldBinary) {
-            assert(query.offsetLog.getLatest().get._2.metadataOpt.get
-              .conf.get(entry.key).contains(version.toString))
+          if (!legacyCheckpoint) {
+            assert(query.streamMetadata.joinEventTimeColumnRetentionVersion.getOrElse(0) == version)
           }
+          assert(query.offsetLog.getLatest().get._2.metadataOpt.get
+            .conf.get(entry.key).contains(version.toString))
         }
 
         testStream(joined)(
@@ -437,33 +434,13 @@ abstract class StreamingInnerJoinBase extends StreamingJoinSuite {
           val metadataPath = new Path(checkpoint.getCanonicalPath, "metadata")
           val hadoopConf = spark.sessionState.newHadoopConf()
           val metadata = StreamMetadata.read(metadataPath, hadoopConf).get
-          val fs = metadataPath.getFileSystem(hadoopConf)
-          assert(fs.delete(metadataPath, false))
-          val output = fs.create(metadataPath, false)
-          try {
-            output.write(s"""{"id":"${metadata.id}"}""".getBytes(StandardCharsets.UTF_8))
-          } finally {
-            output.close()
-          }
+          assert(metadataPath.getFileSystem(hadoopConf).delete(metadataPath, false))
+          StreamMetadata.write(
+            metadata.copy(joinEventTimeColumnRetentionVersion = Some(1)),
+            metadataPath,
+            hadoopConf)
           assert(StreamMetadata.read(metadataPath, hadoopConf).get
-            .joinEventTimeColumnRetentionVersion.isEmpty)
-        }
-
-        if (strippedByOldBinary) {
-          val offsetsPath = checkpoint.getCanonicalPath + "/offsets"
-          val offsetLog = new OffsetSeqLog(spark, offsetsPath)
-          val (latestBatch, latestOffsets) = offsetLog.getLatest().get
-          val stripped = latestOffsets match {
-            case offsets: OffsetSeq =>
-              offsets.copy(metadataOpt = offsets.metadataOpt.map { metadata =>
-                metadata.copy(conf = metadata.conf - entry.key)
-              })
-            case offsets: OffsetMap =>
-              offsets.copy(metadata = offsets.metadata.copy(
-                conf = offsets.metadata.conf - entry.key))
-          }
-          // An old binary writes this next offset before state-schema validation rejects it.
-          assert(offsetLog.add(latestBatch + 1, stripped))
+            .joinEventTimeColumnRetentionVersion.contains(1))
         }
 
         val lateLeft = if (version == 1 || excludeColumnPruning) {
@@ -1779,6 +1756,47 @@ abstract class StreamingOuterJoinBase extends StreamingJoinSuite {
 
   private object RestartMode extends Enumeration {
     val WithoutRestart, WithRestart = Value
+  }
+
+  test("SPARK-60850: restore retention before checking a restarted outer join") {
+    withTempDir { checkpoint =>
+      val entry = SQLConf.STREAMING_JOIN_EVENT_TIME_COLUMN_RETENTION_VERSION
+      val leftInput = MemoryStream[(Int, Int, Int)]
+      val rightInput = MemoryStream[(Int, Int)]
+      val left = leftInput.toDF().toDF("key", "eventSeconds", "joinSeconds")
+        .select(
+          $"key".as("leftKey"),
+          timestamp_seconds($"eventSeconds").as("leftEventTime"),
+          timestamp_seconds($"joinSeconds").as("leftJoinTime"))
+        .withWatermark("leftEventTime", "5 seconds")
+      val right = rightInput.toDF().toDF("key", "eventSeconds")
+        .select(
+          $"key".as("rightKey"),
+          timestamp_seconds($"eventSeconds").as("rightEventTime"))
+        .withWatermark("rightEventTime", "5 seconds")
+      val joined = left.join(right,
+        left("leftKey") === right("rightKey") &&
+          left("leftJoinTime") > right("rightEventTime"), "left_outer")
+        .select(left("leftKey"), right("rightKey"))
+      val checkpointLocation = checkpoint.getCanonicalPath
+
+      testStream(joined)(
+        StartStream(
+          additionalConfs = Map(entry.key -> "0"),
+          checkpointLocation = checkpointLocation),
+        AddData(leftInput, (1, 20, 200)),
+        CheckAnswer(),
+        StopStream,
+        StartStream(
+          additionalConfs = Map(entry.key -> "1"),
+          checkpointLocation = checkpointLocation),
+        Execute { query =>
+          assert(query.sparkSessionForStream.conf.get(entry.key) == "0")
+        },
+        AddData(rightInput, (1, 150)),
+        CheckNewAnswer((1, 1)),
+        StopStream)
+    }
   }
 
   for {

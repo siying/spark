@@ -17,6 +17,8 @@
 
 package org.apache.spark.sql.catalyst.plans.logical
 
+import java.util.IdentityHashMap
+
 import org.apache.spark.sql.catalyst.{AliasIdentifier, InternalRow, SQLConfHelper}
 import org.apache.spark.sql.catalyst.analysis.{Analyzer, AnsiStringPromotionTypeCoercion, AnsiTypeCoercion, MultiInstanceRelation, Resolver, TypeCoercion, TypeCoercionBase, UnresolvedUnaryNode, WidenStatefulOpNullability}
 import org.apache.spark.sql.catalyst.catalog.{CatalogStorageFormat, CatalogTable}
@@ -720,8 +722,68 @@ case class Union(
 }
 
 object Join {
-  private val useRetainedEventTimeColumnTag = TreeNodeTag[Unit](
+  private val useRetainedEventTimeColumnTag = TreeNodeTag[Boolean](
     "streaming_join_use_retained_event_time_column")
+
+  /**
+   * Finds stream-stream joins that are not chained with another stream-stream join. Retaining an
+   * event-time column is safe for independent joins, including joins in separate Union branches.
+   * For chained joins, retaining the column below one join can make another join treat buffered
+   * output as late, so every join in that chain keeps the legacy behavior.
+   */
+  private[sql] def eventTimeColumnRetentionEligibility(
+      plan: LogicalPlan): IdentityHashMap[Join, java.lang.Boolean] = {
+    val result = new IdentityHashMap[Join, java.lang.Boolean]()
+
+    def visit(node: LogicalPlan, hasStatefulJoinAncestor: Boolean): Boolean = {
+      val statefulJoin = node match {
+        case join: Join if join.isStateful => Some(join)
+        case _ => None
+      }
+      var hasStatefulJoinDescendant = false
+      node.children.foreach { child =>
+        if (visit(child, hasStatefulJoinAncestor || statefulJoin.isDefined)) {
+          hasStatefulJoinDescendant = true
+        }
+      }
+      statefulJoin match {
+        case Some(join) =>
+          val eligible = !hasStatefulJoinAncestor && !hasStatefulJoinDescendant
+          val previous = result.get(join)
+          result.put(join, eligible && (previous == null || previous.booleanValue()))
+          true
+        case None => hasStatefulJoinDescendant
+      }
+    }
+
+    if (plan.isStreaming && plan.containsPattern(JOIN)) {
+      visit(plan, hasStatefulJoinAncestor = false)
+    }
+    result
+  }
+
+  /** Copies a plan while recording event-time retention eligibility on each stateful Join. */
+  private[sql] def withEventTimeColumnRetentionEligibility(
+      plan: LogicalPlan,
+      enabled: Boolean): LogicalPlan = {
+    val copiedPlan = plan.clone()
+    def copyTags(original: LogicalPlan, copied: LogicalPlan): Unit = {
+      copied.copyTagsFrom(original)
+      original.children.zip(copied.children).foreach { case (originalChild, copiedChild) =>
+        copyTags(originalChild, copiedChild)
+      }
+    }
+    copyTags(plan, copiedPlan)
+
+    val eligibility = eventTimeColumnRetentionEligibility(copiedPlan)
+    copiedPlan.foreach {
+      case join: Join if join.isStateful =>
+        join.setUseRetainedEventTimeColumn(
+          enabled && Option(eligibility.get(join)).exists(_.booleanValue()))
+      case _ =>
+    }
+    copiedPlan
+  }
 
   def computeOutput(
     joinType: JoinType,
@@ -868,15 +930,10 @@ case class Join(
   override def isStateful: Boolean = left.isStreaming && right.isStreaming
 
   private[sql] def useRetainedEventTimeColumn: Boolean =
-    getTagValue(Join.useRetainedEventTimeColumnTag).isDefined
+    getTagValue(Join.useRetainedEventTimeColumnTag).contains(true)
 
-  private[sql] def setUseRetainedEventTimeColumn(enabled: Boolean): Unit = {
-    if (enabled) {
-      setTagValue(Join.useRetainedEventTimeColumnTag, ())
-    } else {
-      unsetTagValue(Join.useRetainedEventTimeColumnTag)
-    }
-  }
+  private[sql] def setUseRetainedEventTimeColumn(enabled: Boolean): Unit =
+    setTagValue(Join.useRetainedEventTimeColumnTag, enabled)
 }
 
 /**

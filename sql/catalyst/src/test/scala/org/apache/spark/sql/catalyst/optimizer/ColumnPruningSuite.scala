@@ -472,6 +472,7 @@ class ColumnPruningSuite extends PlanTest {
         comparePlans(optimized, expected)
         val optimizedJoin = optimized.collectFirst { case join: Join => join }.get
         assert(optimizedJoin.useRetainedEventTimeColumn == (version == 1))
+        assert(!join.useRetainedEventTimeColumn)
         assert(!join.references.exists(_.metadata.contains(EventTimeWatermark.delayKey)))
       }
     }
@@ -622,6 +623,31 @@ class ColumnPruningSuite extends PlanTest {
         assert(!input.output.exists(_.name.endsWith("Extra")))
       }
       comparePlans(Optimize.execute(optimized), optimized)
+    }
+  }
+
+  test("SPARK-60850: independent joins retain event time without mutating input plans") {
+    val (left1, right1) = watermarkedJoinInputs()
+    val (left2, right2) = (left1.newInstance(), right1.newInstance())
+    val join1 = Join(left1, right1, Inner,
+      Some(left1.output.head === right1.output.head), JoinHint.NONE)
+    val join2 = Join(left2, right2, Inner,
+      Some(left2.output.head === right2.output.head), JoinHint.NONE)
+    val branch1 = Project(Seq(left1.output.head), join1)
+    val branch2 = Project(Seq(left2.output.head), join2)
+    withSQLConf(SQLConf.STREAMING_JOIN_EVENT_TIME_COLUMN_RETENTION_VERSION.key -> "1") {
+      Optimize.execute(branch1)
+      Optimize.execute(branch2)
+      assert(!join1.useRetainedEventTimeColumn)
+      assert(!join2.useRetainedEventTimeColumn)
+
+      val optimized = Optimize.execute(Union(Seq(branch1, branch2)))
+      val joins = optimized.collect { case join: Join => join }
+      assert(joins.size == 2)
+      assert(joins.forall(_.useRetainedEventTimeColumn))
+      joins.flatMap(_.children).foreach { input =>
+        assert(input.output.exists(_.metadata.contains(EventTimeWatermark.delayKey)))
+      }
     }
   }
 

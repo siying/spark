@@ -202,9 +202,10 @@ class MicroBatchExecution(
     SQLConf.STREAMING_JOIN_EVENT_TIME_COLUMN_RETENTION_VERSION.key
 
   private def joinEventTimeColumnRetentionVersion(offsets: OffsetSeqBase): Int = {
-    offsets.metadataOpt.flatMap(_.conf.get(joinEventTimeColumnRetentionVersionKey))
-      .map(_.toInt)
-      .getOrElse(streamMetadata.joinEventTimeColumnRetentionVersion.getOrElse(0))
+    offsets.metadataOpt.map { metadata =>
+      OffsetSeqMetadata.readValue(
+        metadata, SQLConf.STREAMING_JOIN_EVENT_TIME_COLUMN_RETENTION_VERSION).toInt
+    }.getOrElse(0)
   }
 
   private def latestOffsetSeqWithRetentionVersion: Option[(Long, OffsetSeqBase)] = {
@@ -243,12 +244,12 @@ class MicroBatchExecution(
       "logicalPlan must be initialized in QueryExecutionThread " +
         s"but the current thread was ${Thread.currentThread}")
     val streamConf = sparkSessionForStream.sessionState.conf
-    // Once an offset records this version, it is authoritative. StreamMetadata is only the
-    // fallback before batch 0 and for an offset written by an older binary that omitted the key.
-    // The fallback cannot distinguish an uncommitted offset from legacy state committed by that
-    // binary. Therefore, new -> old -> new is not generally compatible: the final upgrade can fail
-    // state-schema validation. Supporting downgrade requires the old binary to understand this
-    // version, so retain the query-level choice here instead of guessing version 0.
+    // Once any offset exists, it is authoritative. A missing key means version 0, as it does for
+    // every other legacy offset-log config. StreamMetadata is only the pre-batch-0 fallback.
+    // Therefore, new -> old -> new is not generally compatible: if the old binary writes an
+    // offset without the key on top of version-1 state, the final upgrade selects version 0 and
+    // fails state-schema validation. Supporting that downgrade requires the old binary to
+    // understand this version; guessing version 1 here could instead misread legacy state.
     val retentionVersion = initialLatestOffsetSeq.map { case (_, offsets) =>
       joinEventTimeColumnRetentionVersion(offsets)
     }.getOrElse(streamMetadata.joinEventTimeColumnRetentionVersion.getOrElse(0))

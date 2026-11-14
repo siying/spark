@@ -29,7 +29,7 @@ import org.apache.spark.annotation.Evolving
 import org.apache.spark.internal.Logging
 import org.apache.spark.internal.LogKeys.{CLASS_NAME, QUERY_ID, RUN_ID}
 import org.apache.spark.sql.catalyst.catalog.CatalogTable
-import org.apache.spark.sql.catalyst.plans.logical.Except
+import org.apache.spark.sql.catalyst.plans.logical.{Except, Join}
 import org.apache.spark.sql.catalyst.streaming.{WriteToStream, WriteToStreamStatement}
 import org.apache.spark.sql.connector.catalog.{Identifier, SupportsWrite, Table, TableCatalog}
 import org.apache.spark.sql.errors.QueryExecutionErrors
@@ -285,10 +285,14 @@ class StreamingQueryManager private[sql] (
       catalogTable)
 
     // Unsupported-operation checks run during this initial analysis, before the normal offset-log
-    // configuration restoration. Read the compatibility value early for existing queries that
-    // contain a streaming EXCEPT so that upgrading does not change whether the query is accepted.
+    // configuration restoration. Read compatibility values early when they affect whether an
+    // existing query is accepted.
     def hasExceptWithStreamingLeft: Boolean = analyzedPlan.exists {
       case Except(left, _, _) if left.isStreaming => true
+      case _ => false
+    }
+    def hasStatefulJoin: Boolean = analyzedPlan.exists {
+      case join: Join if join.isStateful => true
       case _ => false
     }
 
@@ -299,7 +303,7 @@ class StreamingQueryManager private[sql] (
       case _: ContinuousTrigger => (sparkSession, dataStreamWritePlan)
       case _ if recoverFromCheckpointLocation &&
           hasPersistentCheckpointLocation &&
-          hasExceptWithStreamingLeft =>
+          (hasExceptWithStreamingLeft || hasStatefulJoin) =>
         val (resolvedCheckpointRoot, _) = sparkSession.withActive {
           ResolveWriteToStream.resolveCheckpointLocation(dataStreamWritePlan)
         }
@@ -307,18 +311,40 @@ class StreamingQueryManager private[sql] (
           userSpecifiedCheckpointLocation = Some(resolvedCheckpointRoot))
         val checkpointMetadata = new StreamingQueryCheckpointMetadata(
           sparkSession, resolvedCheckpointRoot, readOnly = true)
-
-        val analysisSession = checkpointMetadata.offsetLog.getLatest()
-          .flatMap(_._2.metadataOpt)
-          .map { metadata =>
-            val allowStreamingExcept = OffsetSeqMetadata.readValue(
+        val latestOffsets = checkpointMetadata.offsetLog.getLatest().map(_._2)
+        val allowStreamingExcept = if (hasExceptWithStreamingLeft) {
+          latestOffsets.flatMap(_.metadataOpt).map { metadata =>
+            OffsetSeqMetadata.readValue(
               metadata, SQLConf.ALLOW_EXCEPT_ON_STREAMING_DATAFRAME).toBoolean
-            val newSession = sparkSession.cloneSession()
-            newSession.conf.set(
-              SQLConf.ALLOW_EXCEPT_ON_STREAMING_DATAFRAME, allowStreamingExcept)
-            newSession
           }
-          .getOrElse(sparkSession)
+        } else {
+          None
+        }
+        val joinEventTimeColumnRetentionVersion = if (hasStatefulJoin) {
+          latestOffsets match {
+            case Some(offsets) => Some(offsets.metadataOpt.map { metadata =>
+              OffsetSeqMetadata.readValue(
+                metadata, SQLConf.STREAMING_JOIN_EVENT_TIME_COLUMN_RETENTION_VERSION).toInt
+            }.getOrElse(0))
+            case None => checkpointMetadata.readStreamMetadata()
+              .map(_.joinEventTimeColumnRetentionVersion.getOrElse(0))
+          }
+        } else {
+          None
+        }
+        val analysisSession = if (
+            allowStreamingExcept.isDefined || joinEventTimeColumnRetentionVersion.isDefined) {
+          val newSession = sparkSession.cloneSession()
+          allowStreamingExcept.foreach { value =>
+            newSession.conf.set(SQLConf.ALLOW_EXCEPT_ON_STREAMING_DATAFRAME, value)
+          }
+          joinEventTimeColumnRetentionVersion.foreach { value =>
+            newSession.conf.set(SQLConf.STREAMING_JOIN_EVENT_TIME_COLUMN_RETENTION_VERSION, value)
+          }
+          newSession
+        } else {
+          sparkSession
+        }
         (analysisSession, resolvedDataStreamWritePlan)
       case _ => (sparkSession, dataStreamWritePlan)
     }

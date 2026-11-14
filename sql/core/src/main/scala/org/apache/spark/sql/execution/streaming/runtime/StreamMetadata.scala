@@ -42,9 +42,9 @@ import org.apache.spark.util.Utils
  *           that needs to be persisted across restarts
  * @param joinEventTimeColumnRetentionVersion stable version of stream-stream join event-time
  *           retention. An offset-log value takes precedence once present. This query-level value
- *           is used before the first offset is written and when an older binary writes an offset
- *           without the setting. It cannot make a new -> old -> new checkpoint sequence generally
- *           compatible because the old binary may commit state with its legacy schema.
+ *           is used only before the first offset is written. A later offset without the setting is
+ *           treated as legacy version 0. Consequently, a new -> old -> new sequence is not
+ *           generally compatible if the old binary appends an offset to version-1 state.
  */
 case class StreamMetadata(
     id: String,

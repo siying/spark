@@ -342,6 +342,54 @@ class StreamingInnerJoinV4Suite
   }
 
   testWithVirtualColumnFamilyJoins(
+    "SPARK-60850: retained V4 state supports a range predicate after restart") {
+    withTempDir { checkpointDir =>
+      val leftInput = MemoryStream[(Int, Int)]
+      val rightInput = MemoryStream[(Int, Int)]
+      val left = leftInput.toDF().toDF("key", "seconds")
+        .select($"key", timestamp_seconds($"seconds").as("leftTime"))
+        .withWatermark("leftTime", "5 seconds")
+      val right = rightInput.toDF().toDF("key", "seconds")
+        .select($"key", timestamp_seconds($"seconds").as("rightTime"))
+        .withWatermark("rightTime", "5 seconds")
+      val checkpointLocation = checkpointDir.getCanonicalPath
+      val start = StartStream(
+        additionalConfs = Map(
+          SQLConf.STREAMING_JOIN_EVENT_TIME_COLUMN_RETENTION_VERSION.key -> "1"),
+        checkpointLocation = checkpointLocation)
+
+      val equalityJoin = left.join(right, "key").select(left("key"))
+      testStream(equalityJoin)(
+        start,
+        AddData(leftInput, (1, 20)),
+        CheckAnswer(),
+        assertNumStateRows(total = 1, updated = 1),
+        StopStream)
+
+      val rangeJoin = left.join(right,
+        left("key") === right("key") &&
+          left("leftTime").between(
+            right("rightTime") - expr("INTERVAL 5 SECONDS"),
+            right("rightTime") + expr("INTERVAL 5 SECONDS")))
+        .select(left("key"))
+      testStream(rangeJoin)(
+        start,
+        AddData(rightInput, (1, 22)),
+        CheckNewAnswer(1),
+        assertNumStateRows(total = 2, updated = 1),
+        AddData(leftInput, (8, 100)),
+        CheckNewAnswer(),
+        assertNumStateRows(total = 3, updated = 1),
+        AddData(rightInput, (9, 100)),
+        CheckNewAnswer(),
+        assertNumStateRows(
+          total = Seq(2), updated = Seq(1), droppedByWatermark = Seq(0),
+          removed = Some(Seq(2))),
+        StopStream)
+    }
+  }
+
+  testWithVirtualColumnFamilyJoins(
     "SPARK-56406: secondary index populated on both sides when watermark is on join key") {
     withTempDir { checkpointDir =>
       val input1 = MemoryStream[(Int, Int)]

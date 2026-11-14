@@ -972,7 +972,7 @@ object LimitPushDown extends Rule[LogicalPlan] {
   }
 
   private def pushLocalLimitThroughJoin(limitExpr: Expression, join: Join): Join = {
-    join.joinType match {
+    val rewritten = join.joinType match {
       case RightOuter if join.condition.nonEmpty =>
         join.copy(right = maybePushLocalLimit(limitExpr, join.right))
       case LeftOuter if join.condition.nonEmpty =>
@@ -985,6 +985,10 @@ object LimitPushDown extends Rule[LogicalPlan] {
         join.copy(left = maybePushLocalLimit(limitExpr, join.left))
       case _ => join
     }
+    if (rewritten ne join) {
+      rewritten.copyTagsFrom(join)
+    }
+    rewritten
   }
 
   def apply(plan: LogicalPlan): LogicalPlan = plan.transformWithPruning(
@@ -1515,16 +1519,18 @@ object PushProjectionThroughUnion extends Rule[LogicalPlan] {
 object ColumnPruning extends Rule[LogicalPlan] {
 
   def apply(plan: LogicalPlan): LogicalPlan = {
-    // Multiple stateful joins can emit buffered rows behind their output watermark. Retaining
-    // an event-time column at a downstream join would incorrectly classify such rows as late.
-    val statefulJoins = plan.collect { case join: Join if join.isStateful => join }
-    val preserveJoinEventTime =
-      conf.getConf(SQLConf.STREAMING_JOIN_EVENT_TIME_COLUMN_RETENTION_VERSION) == 1 &&
-        (statefulJoins.size == 1 ||
-          (statefulJoins.nonEmpty && statefulJoins.forall(_.useRetainedEventTimeColumn)))
-    statefulJoins.foreach(_.setUseRetainedEventTimeColumn(preserveJoinEventTime))
+    val retentionEnabled =
+      conf.getConf(SQLConf.STREAMING_JOIN_EVENT_TIME_COLUMN_RETENTION_VERSION) == 1
+    // Copy before setting the tag. Mutating the input can make optimizing one DataFrame change the
+    // analyzed plan reused by another DataFrame. A false tag is also recorded so TreeNode's
+    // automatic tag copying cannot restore a stale true value from the input Join.
+    val taggedPlan = if (plan.isStreaming && plan.containsPattern(JOIN)) {
+      Join.withEventTimeColumnRetentionEligibility(plan, retentionEnabled)
+    } else {
+      plan
+    }
 
-    removeProjectBeforeFilter(plan.transformWithPruning(AlwaysProcess.fn, ruleId) {
+    removeProjectBeforeFilter(taggedPlan.transformWithPruning(AlwaysProcess.fn, ruleId) {
     // Prunes the unused columns from project list of Project/Aggregate/Expand
     case p @ Project(_, p2: Project) if !p2.outputSet.subsetOf(p.references) =>
       p.copy(child = p2.copy(projectList = p2.projectList.filter(p.references.contains)))
@@ -1656,7 +1662,9 @@ object ColumnPruning extends Rule[LogicalPlan] {
       val required = requiredInputReferences(child) ++ p.references
       if (!child.inputSet.subsetOf(required)) {
         val newChildren = child.children.map(c => prunedChild(c, required))
-        p.copy(child = child.withNewChildren(newChildren))
+        val newChild = child.withNewChildren(newChildren)
+        newChild.copyTagsFrom(child)
+        p.copy(child = newChild)
       } else {
         p
       }

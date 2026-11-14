@@ -56,11 +56,17 @@ class StreamingQueryCheckpointMetadata(
       checkpointFile(StreamingCheckpointConstants.DIR_NAME_COMMITS),
       readOnly)
 
+  /** Reads query metadata without creating it when the checkpoint has none. */
+  private[sql] def readStreamMetadata(): Option[StreamMetadata] = {
+    val metadataPath = new Path(checkpointFile(StreamingCheckpointConstants.DIR_NAME_METADATA))
+    StreamMetadata.read(metadataPath, sparkSession.sessionState.newHadoopConf())
+  }
+
   /** Metadata associated with the whole query */
   final lazy val streamMetadata: StreamMetadata = {
     val metadataPath = new Path(checkpointFile(StreamingCheckpointConstants.DIR_NAME_METADATA))
     val hadoopConf = sparkSession.sessionState.newHadoopConf()
-    StreamMetadata.read(metadataPath, hadoopConf).getOrElse {
+    readStreamMetadata().getOrElse {
       // Before creating a new metadata file with a new query ID, validate that the checkpoint
       // is not in an inconsistent state where the metadata file is missing but offset/commit
       // logs have data. This prevents data duplication when using exactly-once sinks

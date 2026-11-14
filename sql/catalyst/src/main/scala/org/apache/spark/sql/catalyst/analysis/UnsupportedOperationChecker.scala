@@ -224,10 +224,15 @@ object UnsupportedOperationChecker extends Logging {
 
     val columnPruningEnabled = !SQLConf.get.optimizerExcludedRules.toSeq
       .flatMap(Utils.stringToSeq).contains(ColumnPruning.ruleName)
-    val useRetainedJoinEventTimeColumn =
-      SQLConf.get.getConf(SQLConf.STREAMING_JOIN_EVENT_TIME_COLUMN_RETENTION_VERSION) == 1 &&
-        columnPruningEnabled &&
-        plan.collect { case join: Join if join.isStateful => join }.size == 1
+    val retainedJoinEventTimeEligibility =
+      if (SQLConf.get.getConf(SQLConf.STREAMING_JOIN_EVENT_TIME_COLUMN_RETENTION_VERSION) == 1 &&
+          columnPruningEnabled) {
+        Join.eventTimeColumnRetentionEligibility(plan)
+      } else {
+        new java.util.IdentityHashMap[Join, java.lang.Boolean]()
+      }
+    def useRetainedJoinEventTimeColumn(join: Join): Boolean =
+      Option(retainedJoinEventTimeEligibility.get(join)).exists(_.booleanValue())
 
     // Disallow mixing `mapGroupsWithState`s and `flatMapGroupsWithState`s
     if (mapGroupsWithStates.nonEmpty && flatMapGroupsWithStates.nonEmpty) {
@@ -535,7 +540,7 @@ object UnsupportedOperationChecker extends Logging {
                 throwError("FullOuter joins with streaming DataFrames/Datasets on the right " +
                   "and a static DataFrame/Dataset on the left is not supported")
               } else if (left.isStreaming && right.isStreaming) {
-                checkForStreamStreamJoinWatermark(j, useRetainedJoinEventTimeColumn)
+                checkForStreamStreamJoinWatermark(j, useRetainedJoinEventTimeColumn(j))
               }
 
             case LeftAnti =>
@@ -551,7 +556,7 @@ object UnsupportedOperationChecker extends Logging {
                 throwError(s"$joinType join with a streaming DataFrame/Dataset " +
                   "on the right and a static DataFrame/Dataset on the left is not supported")
               } else if (left.isStreaming && right.isStreaming) {
-                checkForStreamStreamJoinWatermark(j, useRetainedJoinEventTimeColumn)
+                checkForStreamStreamJoinWatermark(j, useRetainedJoinEventTimeColumn(j))
               }
 
             // We support streaming right outer joins with static on the left always, and with
@@ -561,7 +566,7 @@ object UnsupportedOperationChecker extends Logging {
                 throwError("RightOuter join with a streaming DataFrame/Dataset on the left and " +
                     "a static DataFrame/DataSet on the right not supported")
               } else if (left.isStreaming && right.isStreaming) {
-                checkForStreamStreamJoinWatermark(j, useRetainedJoinEventTimeColumn)
+                checkForStreamStreamJoinWatermark(j, useRetainedJoinEventTimeColumn(j))
               }
 
             case NaturalJoin(_) | UsingJoin(_, _) =>
