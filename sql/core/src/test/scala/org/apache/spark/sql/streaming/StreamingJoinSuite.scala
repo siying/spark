@@ -576,6 +576,61 @@ abstract class StreamingInnerJoinBase extends StreamingJoinSuite {
     }
   }
 
+  test("SPARK-60850: materialized CTE preserves the logical retention decision") {
+    withSQLConf(SQLConf.STREAMING_JOIN_EVENT_TIME_COLUMN_RETENTION_VERSION.key -> "1") {
+      withTempView("leftRetentionCte", "rightRetentionCte") {
+        val leftInput = MemoryStream[(Int, Int, Int)]
+        val rightInput = MemoryStream[(Int, Int)]
+        leftInput.toDF().toDF("key", "eventSeconds", "joinSeconds")
+          .select(
+            $"key",
+            timestamp_seconds($"eventSeconds").as("leftEventTime"),
+            timestamp_seconds($"joinSeconds").as("leftJoinTime"))
+          .withWatermark("leftEventTime", "5 seconds")
+          .createOrReplaceTempView("leftRetentionCte")
+        rightInput.toDF().toDF("key", "eventSeconds")
+          .select($"key", timestamp_seconds($"eventSeconds").as("rightEventTime"))
+          .withWatermark("rightEventTime", "5 seconds")
+          .createOrReplaceTempView("rightRetentionCte")
+        val joined = spark.sql(
+          """
+            |WITH j AS MATERIALIZED (
+            |  SELECT l.key
+            |  FROM leftRetentionCte l JOIN rightRetentionCte r
+            |  ON l.key = r.key AND l.leftJoinTime > r.rightEventTime
+            |)
+            |SELECT key FROM j
+            |UNION ALL
+            |SELECT key FROM j
+            |""".stripMargin)
+
+        testStream(joined)(
+          AddData(leftInput, (1, 20, 200)),
+          CheckAnswer(),
+          AddData(rightInput, (9, 20)),
+          CheckAnswer(),
+          AddData(leftInput, (8, 100, 100)),
+          CheckAnswer(),
+          AddData(rightInput, (7, 100)),
+          CheckAnswer(),
+          Execute { query =>
+            val logicalJoins = query.lastExecution.optimizedPlan.collect {
+              case join: Join => join
+            }
+            assert(logicalJoins.size == 2)
+            assert(logicalJoins.forall(_.useRetainedEventTimeColumn))
+            val physicalJoins = query.lastExecution.executedPlan.collect {
+              case join: StreamingSymmetricHashJoinExec => join
+            }
+            assert(physicalJoins.nonEmpty)
+            assert(physicalJoins.forall(_.useRetainedEventTimeColumn))
+          },
+          AddData(rightInput, (1, 150)),
+          CheckNewAnswer(1, 1))
+      }
+    }
+  }
+
   Seq(0, 1).foreach { version =>
     test(s"SPARK-60850: chained joins keep buffered matches (version=$version)") {
       withSQLConf(

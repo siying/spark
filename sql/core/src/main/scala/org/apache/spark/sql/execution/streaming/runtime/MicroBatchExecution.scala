@@ -198,14 +198,7 @@ class MicroBatchExecution(
   // The rewrites of the filters that the scans of the sources got, which the micro-batches check.
   private val pushedFilterRewrites = new StreamingV2ScanPushDown.PushedFilterRewrites
 
-  /**
-   * Cached result of the first `offsetLog.getLatest()` call. Reused by both
-   * `logicalPlan` (to determine `enforceNamed`) and `initializeExecution` (to seed
-   * `latestStartedBatch`). This avoids a redundant `ListStatus` on the checkpoint's
-   * `offsets/` directory during stream startup. Safe to cache: between construction
-   * and `initializeExecution`, nothing else writes the offset log on the query thread.
-   */
-  private lazy val initialLatestOffsetSeq: Option[(Long, OffsetSeqBase)] = {
+  private def latestOffsetSeqWithRetentionVersion: Option[(Long, OffsetSeqBase)] = {
     val retentionVersion = streamMetadata.joinEventTimeColumnRetentionVersion.getOrElse(0)
     val key = SQLConf.STREAMING_JOIN_EVENT_TIME_COLUMN_RETENTION_VERSION.key
     offsetLog.getLatest().map { case (batchId, offsets) =>
@@ -221,6 +214,16 @@ class MicroBatchExecution(
       batchId -> updatedOffsets
     }
   }
+
+  /**
+   * Cached result of the first `offsetLog.getLatest()` call. Reused by both
+   * `logicalPlan` (to determine `enforceNamed`) and `initializeExecution` (to seed
+   * `latestStartedBatch`). This avoids a redundant `ListStatus` on the checkpoint's
+   * `offsets/` directory during stream startup. Safe to cache: between construction
+   * and `initializeExecution`, nothing else writes the offset log on the query thread.
+   */
+  private lazy val initialLatestOffsetSeq: Option[(Long, OffsetSeqBase)] =
+    latestOffsetSeqWithRetentionVersion
 
   override lazy val logicalPlan: LogicalPlan = {
     assert(queryExecutionThread eq Thread.currentThread,
@@ -595,7 +598,7 @@ class MicroBatchExecution(
           log"Last committed batch id = ${MDC(BATCH_ID, lastCommittedBatchId)}, " +
           log"last offset log batch id = ${MDC(CURRENT_BATCH_ID, lastOffsetLogBatchId)}")
         offsetLog.purgeAfter(lastCommittedBatchId)
-        latestStartedBatch = offsetLog.getLatest()
+        latestStartedBatch = latestOffsetSeqWithRetentionVersion
       }
     }
 
@@ -873,7 +876,7 @@ class MicroBatchExecution(
       execCtx: MicroBatchExecutionContext,
       sparkSessionToRunBatches: SparkSession): Unit = {
     execCtx.sinkCommitProgress = None
-    initialLatestOffsetSeq match {
+    latestOffsetSeqWithRetentionVersion match {
       case Some((latestBatchId, nextOffsets)) =>
         /* First assume that we are re-executing the latest known batch
          * in the offset log */

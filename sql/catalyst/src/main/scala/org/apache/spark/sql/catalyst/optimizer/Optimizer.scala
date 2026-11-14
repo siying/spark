@@ -1517,9 +1517,11 @@ object ColumnPruning extends Rule[LogicalPlan] {
   def apply(plan: LogicalPlan): LogicalPlan = {
     // Multiple stateful joins can emit buffered rows behind their output watermark. Retaining
     // an event-time column at a downstream join would incorrectly classify such rows as late.
+    val statefulJoins = plan.collect { case join: Join if join.isStateful => join }
     val preserveJoinEventTime =
       conf.getConf(SQLConf.STREAMING_JOIN_EVENT_TIME_COLUMN_RETENTION_VERSION) == 1 &&
-        plan.collect { case join: Join if join.isStateful => join }.size == 1
+        statefulJoins.size == 1
+    statefulJoins.foreach(_.setUseRetainedEventTimeColumn(preserveJoinEventTime))
 
     removeProjectBeforeFilter(plan.transformWithPruning(AlwaysProcess.fn, ruleId) {
     // Prunes the unused columns from project list of Project/Aggregate/Expand

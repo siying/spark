@@ -722,15 +722,7 @@ class IncrementalExecution(
     }
 
     override def apply(plan: SparkPlan): SparkPlan = {
-      val useRetainedEventTimeColumn =
-        sparkSession.sessionState.conf.getConf(
-          SQLConf.STREAMING_JOIN_EVENT_TIME_COLUMN_RETENTION_VERSION) == 1 &&
-          plan.collect { case _: StreamingSymmetricHashJoinExec => true }.size == 1
-      val planWithRetentionMode = plan.transform {
-        case join: StreamingSymmetricHashJoinExec =>
-          join.copy(useRetainedEventTimeColumn = useRetainedEventTimeColumn)
-      }
-      val planWithStateOpId = planWithRetentionMode transform composedRule
+      val planWithStateOpId = plan transform composedRule
       // Need to check before write to metadata because we need to detect add operator
       // Only check when streaming is restarting and is first batch
       if (isFirstBatch && currentBatchId != 0) {

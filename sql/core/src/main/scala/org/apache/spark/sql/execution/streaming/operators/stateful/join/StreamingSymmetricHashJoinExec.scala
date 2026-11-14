@@ -158,14 +158,28 @@ case class StreamingSymmetricHashJoinExec(
       condition: Option[Expression],
       stateFormatVersion: Int,
       left: SparkPlan,
-      right: SparkPlan) = {
+      right: SparkPlan,
+      useRetainedEventTimeColumn: Boolean) = {
 
     this(
       leftKeys, rightKeys, joinType, JoinConditionSplitPredicates(condition, left, right),
       stateInfo = None,
       eventTimeWatermarkForLateEvents = None, eventTimeWatermarkForEviction = None,
       stateWatermarkPredicates = JoinStateWatermarkPredicates(), stateFormatVersion, left, right,
-      None, useRetainedEventTimeColumn = false)
+      None, useRetainedEventTimeColumn)
+  }
+
+  def this(
+      leftKeys: Seq[Expression],
+      rightKeys: Seq[Expression],
+      joinType: JoinType,
+      condition: Option[Expression],
+      stateFormatVersion: Int,
+      left: SparkPlan,
+      right: SparkPlan) = {
+
+    this(leftKeys, rightKeys, joinType, condition, stateFormatVersion, left, right,
+      useRetainedEventTimeColumn = false)
   }
 
   if (stateFormatVersion < 2 && joinType != Inner) {

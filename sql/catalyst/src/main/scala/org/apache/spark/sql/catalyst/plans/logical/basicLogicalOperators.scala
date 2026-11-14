@@ -720,6 +720,9 @@ case class Union(
 }
 
 object Join {
+  private val useRetainedEventTimeColumnTag = TreeNodeTag[Unit](
+    "streaming_join_use_retained_event_time_column")
+
   def computeOutput(
     joinType: JoinType,
     leftOutput: Seq[Attribute],
@@ -863,6 +866,17 @@ case class Join(
     newLeft: LogicalPlan, newRight: LogicalPlan): Join = copy(left = newLeft, right = newRight)
 
   override def isStateful: Boolean = left.isStreaming && right.isStreaming
+
+  private[sql] def useRetainedEventTimeColumn: Boolean =
+    getTagValue(Join.useRetainedEventTimeColumnTag).isDefined
+
+  private[sql] def setUseRetainedEventTimeColumn(enabled: Boolean): Unit = {
+    if (enabled) {
+      setTagValue(Join.useRetainedEventTimeColumnTag, ())
+    } else {
+      unsetTagValue(Join.useRetainedEventTimeColumnTag)
+    }
+  }
 }
 
 /**

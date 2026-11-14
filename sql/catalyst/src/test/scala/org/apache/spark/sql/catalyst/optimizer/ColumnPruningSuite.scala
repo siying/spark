@@ -458,7 +458,10 @@ class ColumnPruningSuite extends PlanTest {
         val expected = Project(Seq(left.output.head), join.copy(
           left = Project(left.output.take(kept), left),
           right = Project(right.output.take(kept), right)))
-        comparePlans(Optimize.execute(query), expected)
+        val optimized = Optimize.execute(query)
+        comparePlans(optimized, expected)
+        val optimizedJoin = optimized.collectFirst { case join: Join => join }.get
+        assert(optimizedJoin.useRetainedEventTimeColumn == (version == 1))
         assert(!join.references.exists(_.metadata.contains(EventTimeWatermark.delayKey)))
       }
     }
@@ -582,6 +585,7 @@ class ColumnPruningSuite extends PlanTest {
       val optimized = Optimize.execute(Project(Seq(left.output.head), second))
       val joins = optimized.collect { case join: Join => join }
       assert(joins.size == 2)
+      assert(joins.forall(!_.useRetainedEventTimeColumn))
       joins.flatMap(_.children).foreach { input =>
         assert(!input.output.exists(_.metadata.contains(EventTimeWatermark.delayKey)))
         assert(!input.output.exists(_.name.endsWith("Extra")))
