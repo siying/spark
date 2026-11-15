@@ -672,36 +672,56 @@ abstract class StreamingInnerJoinBase extends StreamingJoinSuite {
     }
   }
 
-  Seq(0, 1).foreach { version =>
-    test(s"SPARK-60850: chained joins keep buffered matches (version=$version)") {
+  for {
+    version <- Seq(0, 1)
+    materializedCte <- Seq(false, true)
+  } {
+    test(s"SPARK-60850: chained joins keep buffered matches " +
+        s"(version=$version, materialized CTE=$materializedCte)") {
       withSQLConf(
           SQLConf.STREAMING_JOIN_EVENT_TIME_COLUMN_RETENTION_VERSION.key -> version.toString) {
-        val leftInput = MemoryStream[(Int, Int)]
-        val middleInput = MemoryStream[Int]
-        val rightInput = MemoryStream[Int]
-        val left = leftInput.toDF().toDF("key", "seconds")
-          .select($"key", timestamp_seconds($"seconds").as("eventTime"))
-          .withWatermark("eventTime", "5 seconds")
-        val middle = middleInput.toDF().toDF("key")
-        val right = rightInput.toDF().toDF("key")
-        val joined = left.join(middle, "key").join(right, "key").select("key")
+        withTempView("leftChainCte", "middleChainCte", "rightChainCte") {
+          val leftInput = MemoryStream[(Int, Int)]
+          val middleInput = MemoryStream[Int]
+          val rightInput = MemoryStream[Int]
+          val left = leftInput.toDF().toDF("key", "seconds")
+            .select($"key", timestamp_seconds($"seconds").as("eventTime"))
+            .withWatermark("eventTime", "5 seconds")
+          val middle = middleInput.toDF().toDF("key")
+          val right = rightInput.toDF().toDF("key")
+          val joined = if (materializedCte) {
+            left.createOrReplaceTempView("leftChainCte")
+            middle.createOrReplaceTempView("middleChainCte")
+            right.createOrReplaceTempView("rightChainCte")
+            spark.sql(
+              """
+                |WITH j AS MATERIALIZED (
+                |  SELECT l.key, l.eventTime
+                |  FROM leftChainCte l JOIN middleChainCte m ON l.key = m.key
+                |)
+                |SELECT j.key FROM j JOIN rightChainCte r ON j.key = r.key
+                |""".stripMargin)
+          } else {
+            left.join(middle, "key").join(right, "key").select("key")
+          }
 
-        testStream(joined)(
-          AddData(leftInput, (1, 20)),
-          CheckAnswer(),
-          AddData(rightInput, 1),
-          CheckAnswer(),
-          AddData(leftInput, (9, 100)),
-          CheckAnswer(),
-          AddData(middleInput, 1),
-          CheckNewAnswer(1),
-          Execute { query =>
-            val joins = query.lastExecution.executedPlan.collect {
-              case join: StreamingSymmetricHashJoinExec => join
-            }
-            assert(joins.size == 2)
-            assert(joins.forall(!_.useRetainedEventTimeColumn))
-          })
+          testStream(joined)(
+            AddData(leftInput, (1, 20)),
+            CheckAnswer(),
+            AddData(rightInput, 1),
+            CheckAnswer(),
+            AddData(leftInput, (9, 100)),
+            CheckAnswer(),
+            AddData(middleInput, 1),
+            CheckNewAnswer(1),
+            Execute { query =>
+              val joins = query.lastExecution.executedPlan.collect {
+                case join: StreamingSymmetricHashJoinExec => join
+              }
+              assert(joins.size == 2)
+              assert(joins.forall(!_.useRetainedEventTimeColumn))
+            })
+        }
       }
     }
   }

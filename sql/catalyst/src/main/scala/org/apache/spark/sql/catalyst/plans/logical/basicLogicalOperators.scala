@@ -734,19 +734,40 @@ object Join {
   private[sql] def eventTimeColumnRetentionEligibility(
       plan: LogicalPlan): IdentityHashMap[Join, java.lang.Boolean] = {
     val result = new IdentityHashMap[Join, java.lang.Boolean]()
+    val cteDefinitions = plan.collect {
+      case definition: CTERelationDef => definition.id -> definition.child
+    }.toMap
+    val withJoinAncestor = new IdentityHashMap[LogicalPlan, java.lang.Boolean]()
+    val withoutJoinAncestor = new IdentityHashMap[LogicalPlan, java.lang.Boolean]()
 
     def visit(node: LogicalPlan, hasStatefulJoinAncestor: Boolean): Boolean = {
+      // A shared CTE may occur both independently and below a join. Visit each context once,
+      // combining eligibility below so any chained use disables retention for the definition.
+      val visited = if (hasStatefulJoinAncestor) withJoinAncestor else withoutJoinAncestor
+      val previousVisit = visited.get(node)
+      if (previousVisit != null) {
+        return previousVisit.booleanValue()
+      }
       val statefulJoin = node match {
         case join: Join if join.isStateful => Some(join)
         case _ => None
       }
-      var hasStatefulJoinDescendant = false
-      node.children.foreach { child =>
-        if (visit(child, hasStatefulJoinAncestor || statefulJoin.isDefined)) {
-          hasStatefulJoinDescendant = true
-        }
+      val childHasJoinAncestor = hasStatefulJoinAncestor || statefulJoin.isDefined
+      val hasStatefulJoinDescendant = node match {
+        // Definitions are not execution children. Follow their references instead, including
+        // references through other CTEs, before the optimizer expands materialized definitions.
+        case WithCTE(child, _) => visit(child, childHasJoinAncestor)
+        case ref: CTERelationRef =>
+          cteDefinitions.get(ref.cteId) match {
+            case Some(child) if !ref.recursive => visit(child, childHasJoinAncestor)
+            // Do not assume an unavailable or recursive streaming definition is independent.
+            case _ => ref.isStreaming
+          }
+        case _ =>
+          // Evaluate every child: each visit also records eligibility for joins in that branch.
+          node.children.map(visit(_, childHasJoinAncestor)).contains(true)
       }
-      statefulJoin match {
+      val containsStatefulJoin = statefulJoin match {
         case Some(join) =>
           val eligible = !hasStatefulJoinAncestor && !hasStatefulJoinDescendant
           val previous = result.get(join)
@@ -754,6 +775,8 @@ object Join {
           true
         case None => hasStatefulJoinDescendant
       }
+      visited.put(node, containsStatefulJoin)
+      containsStatefulJoin
     }
 
     if (plan.isStreaming && plan.containsPattern(JOIN)) {

@@ -25,10 +25,11 @@ import org.apache.spark.sql.AnalysisException
 import org.apache.spark.sql.catalyst.ExtendedAnalysisException
 import org.apache.spark.sql.catalyst.expressions.{Attribute, AttributeReference, AttributeSet, CurrentDate, CurrentTimestampLike, Expression, GroupingSets, LocalTimestamp, LocalTimestampNanos, MonotonicallyIncreasingID, NamedExpression, SessionWindow, WindowExpression}
 import org.apache.spark.sql.catalyst.expressions.aggregate.AggregateExpression
-import org.apache.spark.sql.catalyst.optimizer.ColumnPruning
+import org.apache.spark.sql.catalyst.optimizer.{ColumnPruning, InlineCTE}
 import org.apache.spark.sql.catalyst.plans._
 import org.apache.spark.sql.catalyst.plans.logical._
 import org.apache.spark.sql.catalyst.streaming.InternalOutputModes
+import org.apache.spark.sql.catalyst.trees.TreePattern.JOIN
 import org.apache.spark.sql.errors.{QueryCompilationErrors, QueryExecutionErrors}
 import org.apache.spark.sql.internal.SQLConf
 import org.apache.spark.sql.streaming.{GroupStateTimeout, OutputMode}
@@ -221,18 +222,6 @@ object UnsupportedOperationChecker extends Logging {
     val flatMapGroupsWithStates = plan.collect {
       case f: FlatMapGroupsWithState if f.isStreaming && !f.isMapGroupsWithState => f
     }
-
-    val columnPruningEnabled = !SQLConf.get.optimizerExcludedRules.toSeq
-      .flatMap(Utils.stringToSeq).contains(ColumnPruning.ruleName)
-    val retainedJoinEventTimeEligibility =
-      if (SQLConf.get.getConf(SQLConf.STREAMING_JOIN_EVENT_TIME_COLUMN_RETENTION_VERSION) == 1 &&
-          columnPruningEnabled) {
-        Join.eventTimeColumnRetentionEligibility(plan)
-      } else {
-        new java.util.IdentityHashMap[Join, java.lang.Boolean]()
-      }
-    def useRetainedJoinEventTimeColumn(join: Join): Boolean =
-      Option(retainedJoinEventTimeEligibility.get(join)).exists(_.booleanValue())
 
     // Disallow mixing `mapGroupsWithState`s and `flatMapGroupsWithState`s
     if (mapGroupsWithStates.nonEmpty && flatMapGroupsWithStates.nonEmpty) {
@@ -540,7 +529,7 @@ object UnsupportedOperationChecker extends Logging {
                 throwError("FullOuter joins with streaming DataFrames/Datasets on the right " +
                   "and a static DataFrame/Dataset on the left is not supported")
               } else if (left.isStreaming && right.isStreaming) {
-                checkForStreamStreamJoinWatermark(j, useRetainedJoinEventTimeColumn(j))
+                checkForStreamStreamJoinWatermark(j, useRetainedEventTimeColumn = false)
               }
 
             case LeftAnti =>
@@ -556,7 +545,7 @@ object UnsupportedOperationChecker extends Logging {
                 throwError(s"$joinType join with a streaming DataFrame/Dataset " +
                   "on the right and a static DataFrame/Dataset on the left is not supported")
               } else if (left.isStreaming && right.isStreaming) {
-                checkForStreamStreamJoinWatermark(j, useRetainedJoinEventTimeColumn(j))
+                checkForStreamStreamJoinWatermark(j, useRetainedEventTimeColumn = false)
               }
 
             // We support streaming right outer joins with static on the left always, and with
@@ -566,7 +555,7 @@ object UnsupportedOperationChecker extends Logging {
                 throwError("RightOuter join with a streaming DataFrame/Dataset on the left and " +
                     "a static DataFrame/DataSet on the right not supported")
               } else if (left.isStreaming && right.isStreaming) {
-                checkForStreamStreamJoinWatermark(j, useRetainedJoinEventTimeColumn(j))
+                checkForStreamStreamJoinWatermark(j, useRetainedEventTimeColumn = false)
               }
 
             case NaturalJoin(_) | UsingJoin(_, _) =>
@@ -641,6 +630,28 @@ object UnsupportedOperationChecker extends Logging {
 
       // Check if there are unsupported expressions in streaming query plan.
       checkUnsupportedExpressions(subPlan)
+    }
+
+    val excludedRules = SQLConf.get.optimizerExcludedRules.toSeq.flatMap(Utils.stringToSeq)
+    if (SQLConf.get.getConf(SQLConf.STREAMING_JOIN_EVENT_TIME_COLUMN_RETENTION_VERSION) == 1 &&
+        !excludedRules.contains(ColumnPruning.ruleName) && plan.containsPattern(JOIN)) {
+      // Inlining can give a shared CTE independent and chained copies with different retention
+      // eligibility. Match the optimizer's inlining decision and clone to separate reused nodes,
+      // just as ColumnPruning does, without changing the plan used by the structural checks above.
+      val inlineCTE = InlineCTE()
+      val retentionPlan = (if (excludedRules.contains(inlineCTE.ruleName)) {
+        plan
+      } else {
+        inlineCTE(plan)
+      }).clone()
+      val eligibility = Join.eventTimeColumnRetentionEligibility(retentionPlan)
+      retentionPlan.foreach {
+        case join @ Join(_, _, LeftOuter | LeftSemi | RightOuter | FullOuter, _, _)
+            if join.isStateful &&
+              Option(eligibility.get(join)).exists(_.booleanValue()) =>
+          checkForStreamStreamJoinWatermark(join, useRetainedEventTimeColumn = true)
+        case _ =>
+      }
     }
 
     checkStreamingQueryGlobalWatermarkLimit(plan, outputMode)

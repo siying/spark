@@ -651,6 +651,47 @@ class ColumnPruningSuite extends PlanTest {
     }
   }
 
+  Seq(false, true).foreach { chainedUseFirst =>
+    test(s"SPARK-60850: shared CTE join chains (chained use first=$chainedUseFirst)") {
+      val (left, right) = watermarkedJoinInputs()
+      val first = Join(left, right, Inner,
+        Some(left.output.head === right.output.head), JoinHint.NONE)
+      val firstDef = CTERelationDef(Project(left.output.take(2), first),
+        materialized = Some(true))
+      val firstRef = CTERelationRef(firstDef.id, true, firstDef.output, isStreaming = true)
+      val secondDef = CTERelationDef(firstRef, materialized = Some(true))
+      val secondRef = CTERelationRef(secondDef.id, true, secondDef.output, isStreaming = true)
+      val third = right.newInstance()
+      val second = Join(secondRef, third, Inner,
+        Some(secondRef.output.head === third.output.head), JoinHint.NONE)
+      val independent = Project(Seq(firstRef.output.head), firstRef)
+      val chained = Project(Seq(secondRef.output.head), second)
+      val branches = if (chainedUseFirst) Seq(chained, independent) else Seq(independent, chained)
+      val query = WithCTE(Union(branches), Seq(firstDef, secondDef))
+
+      withSQLConf(SQLConf.STREAMING_JOIN_EVENT_TIME_COLUMN_RETENTION_VERSION.key -> "1") {
+        val optimized = Optimize.execute(query)
+        val joins = optimized.collect { case join: Join => join }
+        assert(joins.size == 2)
+        assert(joins.forall(!_.useRetainedEventTimeColumn))
+        val expanded = ReplaceCTERefWithRepartition(optimized)
+        val expandedJoins = expanded.collect { case join: Join => join }
+        assert(expandedJoins.size == 3)
+        assert(expandedJoins.forall(!_.useRetainedEventTimeColumn))
+      }
+    }
+  }
+
+  test("SPARK-60850: unused CTE definitions do not create join chains") {
+    val (left, right) = watermarkedJoinInputs()
+    val unusedJoin = Join(left.newInstance(), right.newInstance(), Inner, None, JoinHint.NONE)
+    val unusedDef = CTERelationDef(unusedJoin, materialized = Some(true))
+    val join = Join(WithCTE(left, Seq(unusedDef)), right, Inner,
+      Some(left.output.head === right.output.head), JoinHint.NONE)
+    val eligibility = Join.eventTimeColumnRetentionEligibility(join)
+    assert(eligibility.get(join).booleanValue())
+  }
+
   test("SPARK-60850: ambiguous event-time inputs are not retained") {
     val (left, right) = watermarkedJoinInputs()
     val otherTime = AttributeReference("otherTime", TimestampType,

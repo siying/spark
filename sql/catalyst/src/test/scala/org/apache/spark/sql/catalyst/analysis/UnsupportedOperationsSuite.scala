@@ -26,7 +26,7 @@ import org.apache.spark.sql.catalyst.dsl.plans._
 import org.apache.spark.sql.catalyst.encoders.ExpressionEncoder
 import org.apache.spark.sql.catalyst.expressions.{Attribute, AttributeReference, Expression, MonotonicallyIncreasingID, NamedExpression}
 import org.apache.spark.sql.catalyst.expressions.aggregate.Count
-import org.apache.spark.sql.catalyst.optimizer.ColumnPruning
+import org.apache.spark.sql.catalyst.optimizer.{ColumnPruning, InlineCTE}
 import org.apache.spark.sql.catalyst.plans._
 import org.apache.spark.sql.catalyst.plans.logical._
 import org.apache.spark.sql.catalyst.streaming.InternalOutputModes._
@@ -38,6 +38,7 @@ import org.apache.spark.sql.types.{IntegerType, LongType, MetadataBuilder, Struc
 case class DummyCommand() extends LeafCommand
 
 class UnsupportedOperationsSuite extends SparkFunSuite with SQLHelper {
+  import UnsupportedOperationsSuite._
 
   val attribute = AttributeReference("a", IntegerType, nullable = true)()
   val watermarkMetadata = new MetadataBuilder()
@@ -597,6 +598,52 @@ class UnsupportedOperationsSuite extends SparkFunSuite with SQLHelper {
         SQLConf.STREAMING_JOIN_EVENT_TIME_COLUMN_RETENTION_VERSION.key -> "1",
         SQLConf.OPTIMIZER_EXCLUDED_RULES.key -> ColumnPruning.ruleName) {
       UnsupportedOperationChecker.checkForStreaming(wrapInStreaming(join), OutputMode.Append())
+    }
+  }
+
+  test("SPARK-60850: retained event-time validation accounts for CTE inlining") {
+    val leftEventTime = AttributeReference(
+      "leftEventTime", TimestampType, metadata = watermarkMetadata)()
+    val leftJoinTime = AttributeReference("leftJoinTime", TimestampType)()
+    val rightEventTime = AttributeReference(
+      "rightEventTime", TimestampType, metadata = watermarkMetadata)()
+    val left = TestStreamingRelation(Seq(attribute, leftEventTime, leftJoinTime))
+    val right = TestStreamingRelation(Seq(attribute.newInstance(), rightEventTime))
+    val third = TestStreamingRelation(Seq(attribute.newInstance()))
+    val outerJoin = left.join(right, joinType = LeftOuter,
+      condition = Some(left.output.head === right.output.head && leftJoinTime > rightEventTime))
+
+    Seq(None, Some(false), Some(true)).foreach { materialized =>
+      val definition = CTERelationDef(outerJoin, materialized = materialized)
+      val reference = CTERelationRef(definition.id, _resolved = true,
+        definition.output, isStreaming = true)
+      val chainedReference = reference.newInstance()
+      val chained = chainedReference.join(third, joinType = Inner,
+        condition = Some(chainedReference.output.head === third.output.head))
+      val query = WithCTE(Union(Seq(
+        Project(Seq(reference.output.head), reference),
+        Project(Seq(chainedReference.output.head), chained))), Seq(definition))
+
+      withSQLConf(SQLConf.STREAMING_JOIN_EVENT_TIME_COLUMN_RETENTION_VERSION.key -> "0") {
+        UnsupportedOperationChecker.checkForStreaming(query, OutputMode.Append())
+      }
+      withSQLConf(SQLConf.STREAMING_JOIN_EVENT_TIME_COLUMN_RETENTION_VERSION.key -> "1") {
+        if (materialized.contains(true)) {
+          UnsupportedOperationChecker.checkForStreaming(query, OutputMode.Append())
+        } else {
+          val error = intercept[AnalysisException] {
+            UnsupportedOperationChecker.checkForStreaming(query, OutputMode.Append())
+          }
+          assert(error.getMessage.contains(
+            "is not supported without a watermark in the join keys, or a watermark on " +
+              "the nullable side and an appropriate range condition"))
+        }
+      }
+      withSQLConf(
+          SQLConf.STREAMING_JOIN_EVENT_TIME_COLUMN_RETENTION_VERSION.key -> "1",
+          SQLConf.OPTIMIZER_EXCLUDED_RULES.key -> InlineCTE().ruleName) {
+        UnsupportedOperationChecker.checkForStreaming(query, OutputMode.Append())
+      }
     }
   }
 
@@ -1449,7 +1496,9 @@ class UnsupportedOperationsSuite extends SparkFunSuite with SQLHelper {
   def wrapInStreaming(plan: LogicalPlan): LogicalPlan = {
     new StreamingPlanWrapper(plan)
   }
+}
 
+object UnsupportedOperationsSuite {
   case class StreamingPlanWrapper(child: LogicalPlan) extends UnaryNode {
     override def output: Seq[Attribute] = child.output
     override def isStreaming: Boolean = true
